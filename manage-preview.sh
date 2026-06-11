@@ -37,20 +37,6 @@ wait_for_port() {
   return 1
 }
 
-# Hit the local server so Vite compiles its entry-point bundle before Caddy
-# exposes the domain — browser never sees the "compiling…" cold start.
-warmup_server() {
-  echo "[preview] Warming up Vite (triggering initial compilation)..."
-  for i in $(seq 1 15); do
-    if curl -sf -o /dev/null --max-time 30 "http://localhost:${PORT}/"; then
-      echo "[preview] Server warm"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "[preview] Warning: warmup timed out — Caddy route added anyway"
-}
-
 add_caddy_route() {
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
   curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
@@ -61,6 +47,15 @@ add_caddy_route() {
       \"handle\": [{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${PORT}\"}]}]
     }"
   echo "[preview] Live at https://${HOST_HEADER}"
+}
+
+# Build the app for production with sourcemaps so stack traces point to real
+# source lines. PREVIEW_BUILD=1 is read by vite.config.ts to enable sourcemaps
+# without affecting Vercel production deployments.
+build_app() {
+  echo "[preview] Building (production + sourcemaps)..."
+  PREVIEW_BUILD=1 pnpm --dir "$WORKTREE/apps/erp" run build
+  echo "[preview] Build complete"
 }
 
 build_ecosystem_json() {
@@ -74,7 +69,7 @@ build_ecosystem_json() {
     }
     env.PORT = '${PORT}';
     env.HOST = '0.0.0.0';
-    env.NODE_ENV = 'development';
+    env.NODE_ENV = 'production';
     env.ERP_URL = 'https://erp-pr-${PR_NUMBER}.foxhole.bot';
     console.log(JSON.stringify(env));
   ")
@@ -84,7 +79,7 @@ build_ecosystem_json() {
   "apps": [{
     "name": "${APP_NAME}",
     "script": "pnpm",
-    "args": "run dev:app",
+    "args": "run start",
     "cwd": "${WORKTREE}/apps/erp",
     "out_file": "${LOGS_PATH}/${APP_NAME}.log",
     "error_file": "${LOGS_PATH}/${APP_NAME}-err.log",
@@ -96,9 +91,8 @@ ECOSYSTEM
 
 # ---------------------------------------------------------------------------
 # Hot update: worktree already exists (PR synchronize / reopened)
-# Only reinstall deps or recompile locales when those actually changed.
-# Vite's file watcher sees the git reset and triggers HMR in the browser
-# automatically — no server restart needed for source-only changes.
+# Always rebuilds so the bundle reflects the latest source.
+# Only reinstalls deps or recompiles locales when those actually changed.
 # ---------------------------------------------------------------------------
 
 hot_update() {
@@ -106,7 +100,6 @@ hot_update() {
 
   git -C "$WORKTREE" fetch origin "${BRANCH}"
 
-  # Capture old state for diffing before we move HEAD
   PREV_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
   OLD_LOCK=$(git -C "$WORKTREE" rev-parse HEAD:pnpm-lock.yaml 2>/dev/null || echo "")
 
@@ -115,11 +108,9 @@ hot_update() {
   NEW_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
   NEW_LOCK=$(git -C "$WORKTREE" rev-parse HEAD:pnpm-lock.yaml 2>/dev/null || echo "")
 
-  DEPS_CHANGED=false
   if [ "$OLD_LOCK" != "$NEW_LOCK" ]; then
     echo "[preview] Dependencies changed, running pnpm install"
     pnpm --dir "$WORKTREE" install --prefer-offline
-    DEPS_CHANGED=true
   else
     echo "[preview] Dependencies unchanged, skipping pnpm install"
   fi
@@ -131,18 +122,11 @@ hot_update() {
     echo "[preview] Locales unchanged, skipping lingui:compile"
   fi
 
-  if [ "$DEPS_CHANGED" = true ]; then
-    # node_modules changed → Vite's module cache is stale, must restart
-    echo "[preview] Restarting dev server (deps changed)"
-    build_ecosystem_json
-    pm2 restart "$APP_NAME" --update-env
-    wait_for_port
-    warmup_server
-  else
-    # Source-only change: Vite's watcher picks up the git reset via HMR.
-    # No restart needed — browser gets changes automatically.
-    echo "[preview] Source-only change — Vite HMR will propagate to browser"
-  fi
+  build_app
+
+  build_ecosystem_json
+  pm2 restart "$APP_NAME" --update-env
+  wait_for_port
 
   echo "[preview] Hot update complete"
 }
@@ -168,6 +152,8 @@ cold_start() {
   # Compile locale catalogs (.mjs files are gitignored, absent in fresh worktrees)
   pnpm --dir "$WORKTREE" lingui:compile
 
+  build_app
+
   set -a
   # shellcheck source=/dev/null
   source /Users/xinjuan/preview/preview.env
@@ -182,10 +168,6 @@ cold_start() {
   pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
 
   wait_for_port
-
-  # Warm up Vite before exposing via Caddy so the first browser hit is fast
-  warmup_server
-
   add_caddy_route
 }
 
@@ -194,8 +176,6 @@ cold_start() {
 # ---------------------------------------------------------------------------
 
 start_preview() {
-  # If the worktree exists and the PM2 process is running, do a fast hot-update
-  # instead of a full teardown+rebuild. This is the PR synchronize case.
   if [ -d "$WORKTREE" ] && git -C "$WORKTREE" rev-parse HEAD >/dev/null 2>&1 \
      && pm2 show "$APP_NAME" 2>/dev/null | grep -q "online"; then
     hot_update
