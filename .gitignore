@@ -1,0 +1,6 @@
+preview.env
+caddy.pid
+logs/
+runner/
+runner-*/
+worktrees/

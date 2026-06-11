@@ -1,0 +1,16 @@
+{
+	admin localhost:2019
+	auto_https off
+}
+
+:80 {
+	@erp_preview host ~^erp-pr-(?P<prnum>\d+)\.preview\.foxhole\.bot$
+	handle @erp_preview {
+		reverse_proxy {
+			dynamic A {header.X-Forwarded-For}
+			# routes are loaded dynamically via admin API
+		}
+	}
+
+	respond 404
+}
