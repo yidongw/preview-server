@@ -37,6 +37,20 @@ wait_for_port() {
   return 1
 }
 
+# Send HTTP requests to the app so V8 JIT compiles hot paths and in-process
+# caches initialize before real user traffic arrives.
+warm_up() {
+  echo "[preview] Warming up ${APP_NAME}..."
+  for i in $(seq 1 10); do
+    if curl -sf -o /dev/null "http://localhost:${PORT}/"; then
+      echo "[preview] Warm-up complete"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "[preview] Warning: warm-up request failed after 20s"
+}
+
 add_caddy_route() {
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
   curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
@@ -127,6 +141,7 @@ hot_update() {
   build_ecosystem_json
   pm2 restart "$APP_NAME" --update-env
   wait_for_port
+  warm_up
 
   echo "[preview] Hot update complete"
 }
@@ -168,6 +183,7 @@ cold_start() {
   pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
 
   wait_for_port
+  warm_up
   add_caddy_route
 }
 
