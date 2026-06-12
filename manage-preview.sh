@@ -53,8 +53,8 @@ add_caddy_route() {
 # source lines. PREVIEW_BUILD=1 is read by vite.config.ts to enable sourcemaps
 # without affecting Vercel production deployments.
 build_app() {
-  echo "[preview] Building (production + sourcemaps)..."
-  PREVIEW_BUILD=1 pnpm --dir "$WORKTREE/apps/erp" run build
+  echo "[preview] Building (production)..."
+  PREVIEW_BUILD=1 NODE_OPTIONS="--max-old-space-size=12288" pnpm --dir "$WORKTREE/apps/erp" run build
   echo "[preview] Build complete"
 }
 
