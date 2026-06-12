@@ -28,6 +28,15 @@ NEXT_APP="${APP_NAME}-next"
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Scan upward from candidate until a port with no listener is found.
+find_free_port() {
+  local candidate="$1"
+  while nc -z localhost "$candidate" 2>/dev/null; do
+    candidate=$((candidate + 1))
+  done
+  echo "$candidate"
+}
+
 wait_for_port() {
   local target="${1:-$PORT}"
   echo "[preview] Waiting for port ${target}..."
@@ -168,8 +177,10 @@ hot_update() {
 
   build_app
 
-  # Start new process on temp port; old process continues serving traffic
+  # Start new process on temp port; old process continues serving traffic.
+  # Kill any stale temp process first, then find a port that's actually free.
   pm2 delete "$NEXT_APP" 2>/dev/null || true
+  NEXT_PORT=$(find_free_port "$NEXT_PORT")
   build_ecosystem_json_for "$NEXT_PORT" "$NEXT_APP"
   pm2 start "${LOGS_PATH}/${NEXT_APP}.ecosystem.json"
   wait_for_port "$NEXT_PORT"
