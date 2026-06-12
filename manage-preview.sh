@@ -20,29 +20,44 @@ APP_NAME="erp-pr-${PR_NUMBER}"
 WORKTREE="${WORKTREE_BASE}/pr-${PR_NUMBER}"
 HOST_HEADER="erp-pr-${PR_NUMBER}.foxhole.bot"
 
+# Temporary port/name used during hot-update blue-green swap
+NEXT_PORT=$((PORT + 5000))
+NEXT_APP="${APP_NAME}-next"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Scan upward from candidate until a port with no listener is found.
+find_free_port() {
+  local candidate="$1"
+  while nc -z localhost "$candidate" 2>/dev/null; do
+    candidate=$((candidate + 1))
+  done
+  echo "$candidate"
+}
+
 wait_for_port() {
-  echo "[preview] Waiting for port ${PORT}..."
+  local target="${1:-$PORT}"
+  echo "[preview] Waiting for port ${target}..."
   for i in $(seq 1 45); do
-    if nc -z localhost "$PORT" 2>/dev/null; then
-      echo "[preview] Port ${PORT} is open"
+    if nc -z localhost "$target" 2>/dev/null; then
+      echo "[preview] Port ${target} is open"
       return 0
     fi
     sleep 2
   done
-  echo "[preview] Warning: port ${PORT} never opened after 90s"
+  echo "[preview] Warning: port ${target} never opened after 90s"
   return 1
 }
 
 # Send HTTP requests to the app so V8 JIT compiles hot paths and in-process
 # caches initialize before real user traffic arrives.
 warm_up() {
-  echo "[preview] Warming up ${APP_NAME}..."
+  local target="${1:-$PORT}"
+  echo "[preview] Warming up on port ${target}..."
   for i in $(seq 1 10); do
-    if curl -sf -o /dev/null "http://localhost:${PORT}/"; then
+    if curl -sf -o /dev/null "http://localhost:${target}/"; then
       echo "[preview] Warm-up complete"
       return 0
     fi
@@ -63,6 +78,16 @@ add_caddy_route() {
   echo "[preview] Live at https://${HOST_HEADER}"
 }
 
+# Atomically update the reverse-proxy upstream for this PR's route.
+# Uses PUT on the named config subtree — no DELETE+POST gap, route stays live.
+update_caddy_upstream() {
+  local target_port="$1"
+  curl -sf -X PUT "http://localhost:2019/id/${APP_NAME}/handle" \
+    -H "Content-Type: application/json" \
+    -d "[{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${target_port}\"}]}]"
+  echo "[preview] ${HOST_HEADER} → localhost:${target_port}"
+}
+
 # Build the app for production with sourcemaps so stack traces point to real
 # source lines. PREVIEW_BUILD=1 is read by vite.config.ts to enable sourcemaps
 # without affecting Vercel production deployments.
@@ -72,8 +97,11 @@ build_app() {
   echo "[preview] Build complete"
 }
 
-build_ecosystem_json() {
-  ENV_JSON=$(node -e "
+build_ecosystem_json_for() {
+  local target_port="$1"
+  local app_name="$2"
+  local env_json
+  env_json=$(node -e "
     const fs = require('fs');
     const lines = fs.readFileSync('/Users/xinjuan/preview/preview.env','utf8').split('\n');
     const env = {};
@@ -81,32 +109,43 @@ build_ecosystem_json() {
       const m = line.match(/^([A-Z0-9_]+)=(.*)\$/);
       if (m) env[m[1]] = m[2].replace(/^\"|\"$/g,'').replace(/^'|'\$/g,'');
     }
-    env.PORT = '${PORT}';
+    env.PORT = '${target_port}';
     env.HOST = '0.0.0.0';
     env.NODE_ENV = 'production';
     env.ERP_URL = 'https://erp-pr-${PR_NUMBER}.foxhole.bot';
     console.log(JSON.stringify(env));
   ")
 
-  cat > "${LOGS_PATH}/${APP_NAME}.ecosystem.json" <<ECOSYSTEM
+  cat > "${LOGS_PATH}/${app_name}.ecosystem.json" <<ECOSYSTEM
 {
   "apps": [{
-    "name": "${APP_NAME}",
+    "name": "${app_name}",
     "script": "pnpm",
     "args": "run start",
     "cwd": "${WORKTREE}/apps/erp",
-    "out_file": "${LOGS_PATH}/${APP_NAME}.log",
-    "error_file": "${LOGS_PATH}/${APP_NAME}-err.log",
-    "env": ${ENV_JSON}
+    "out_file": "${LOGS_PATH}/${app_name}.log",
+    "error_file": "${LOGS_PATH}/${app_name}-err.log",
+    "env": ${env_json}
   }]
 }
 ECOSYSTEM
 }
 
+build_ecosystem_json() {
+  build_ecosystem_json_for "$PORT" "$APP_NAME"
+}
+
 # ---------------------------------------------------------------------------
-# Hot update: worktree already exists (PR synchronize / reopened)
-# Always rebuilds so the bundle reflects the latest source.
-# Only reinstalls deps or recompiles locales when those actually changed.
+# Hot update: zero-downtime blue-green swap
+#
+# 1. Build new bundle (old process keeps serving traffic throughout)
+# 2. Start new process on NEXT_PORT
+# 3. Wait until NEXT_PORT is ready
+# 4. Switch Caddy upstream to NEXT_PORT (atomic, no gap)
+# 5. Kill old process (traffic already on NEXT_PORT)
+# 6. Start fresh process on canonical PORT, wait until ready
+# 7. Switch Caddy back to canonical PORT
+# 8. Kill temp process
 # ---------------------------------------------------------------------------
 
 hot_update() {
@@ -138,10 +177,32 @@ hot_update() {
 
   build_app
 
-  build_ecosystem_json
-  pm2 restart "$APP_NAME" --update-env
-  wait_for_port
-  warm_up
+  # Start new process on temp port; old process continues serving traffic.
+  # Kill any stale temp process first, then find a port that's actually free.
+  pm2 delete "$NEXT_APP" 2>/dev/null || true
+  NEXT_PORT=$(find_free_port "$NEXT_PORT")
+  build_ecosystem_json_for "$NEXT_PORT" "$NEXT_APP"
+  pm2 start "${LOGS_PATH}/${NEXT_APP}.ecosystem.json"
+  wait_for_port "$NEXT_PORT"
+  warm_up "$NEXT_PORT"
+
+  # Switch Caddy only after new process is confirmed ready — zero downtime
+  update_caddy_upstream "$NEXT_PORT"
+
+  # Old process is no longer receiving traffic; tear it down
+  pm2 stop "$APP_NAME" 2>/dev/null || true
+  pm2 delete "$APP_NAME" 2>/dev/null || true
+
+  # Migrate to canonical port so port assignments stay deterministic
+  build_ecosystem_json_for "$PORT" "$APP_NAME"
+  pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
+  wait_for_port "$PORT"
+  warm_up "$PORT"
+  update_caddy_upstream "$PORT"
+
+  # Temp process is no longer receiving traffic; clean it up
+  pm2 stop "$NEXT_APP" 2>/dev/null || true
+  pm2 delete "$NEXT_APP" 2>/dev/null || true
 
   echo "[preview] Hot update complete"
 }
@@ -207,6 +268,8 @@ stop_preview() {
 
   pm2 stop "$APP_NAME" 2>/dev/null || true
   pm2 delete "$APP_NAME" 2>/dev/null || true
+  pm2 stop "$NEXT_APP" 2>/dev/null || true
+  pm2 delete "$NEXT_APP" 2>/dev/null || true
 
   git -C "$REPO_PATH" worktree prune 2>/dev/null || true
   if [ -d "$WORKTREE" ]; then
