@@ -18,14 +18,21 @@ manage-preview.sh start <pr> <branch>
       │   ├── lingui:compile
       │   ├── pnpm build  (PREVIEW_BUILD=1, production bundle)
       │   ├── pm2 start   (port 4000+N)
+      │   ├── warm-up HTTP requests (pre-JIT before user traffic)
       │   └── caddy admin API  →  register route for erp-pr-<N>.foxhole.bot
       │
-      └─ hot update (push to existing PR)
+      └─ hot update (push to existing PR — zero-downtime blue-green swap)
           ├── git fetch + reset --hard
           ├── pnpm install  (only if pnpm-lock.yaml changed)
           ├── lingui:compile  (only if locales/ changed)
-          ├── pnpm build
-          └── pm2 restart --update-env
+          ├── pnpm build        ← old process keeps serving traffic
+          ├── pm2 start NEXT    (temp port, found with find_free_port)
+          ├── wait + warm-up NEXT
+          ├── caddy PUT upstream → NEXT  (atomic, no routing gap)
+          ├── pm2 delete OLD
+          ├── pm2 start on canonical port, wait + warm-up
+          ├── caddy PUT upstream → canonical port
+          └── pm2 delete NEXT
 ```
 
 When a PR is closed or merged:
@@ -33,7 +40,7 @@ When a PR is closed or merged:
 ```
 manage-preview.sh stop <pr>
   ├── caddy admin API  →  DELETE route
-  ├── pm2 stop + delete
+  ├── pm2 stop + delete  (both canonical and any leftover -next process)
   └── git worktree remove + rm -rf
 ```
 
@@ -109,8 +116,15 @@ Formula: `4000 + PR_NUMBER`
 | `caddy.json` | Initial Caddy server config loaded at startup |
 | `Caddyfile` | Reference Caddyfile (not used directly; caddy.json is authoritative) |
 
+## Blue-green hot update
+
+When a push arrives on an open PR, the old process continues serving user traffic while the new bundle is built. Once the new process is ready and pre-warmed, Caddy's upstream is swapped atomically via a `PUT` to the admin API — there is no window where requests return errors. The script then migrates back to the canonical port so port assignments stay deterministic across restarts.
+
+`find_free_port` scans upward from the candidate port to avoid conflicts if a previous temp process didn't clean up.
+
 ## Caveats
 
 - The server must have enough RAM to hold multiple production builds simultaneously. The build step sets `--max-old-space-size=12288` (12 GB).
+- During a hot update, two app processes run briefly in parallel (old + new), doubling memory for that PR temporarily.
 - Worktrees share the repo's object store but each gets a full `node_modules` install, so disk usage grows with the number of concurrent PRs.
 - `preview.env` is gitignored and must be provisioned manually on the host.
