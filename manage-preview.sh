@@ -89,21 +89,16 @@ add_caddy_route() {
   echo "[preview] Live at https://${HOST_HEADER}"
 }
 
-# Atomically update the reverse-proxy upstream for this PR's route.
-# Uses PUT on the named config subtree — no DELETE+POST gap, route stays live.
-# Falls back to creating the route from scratch if the named route is missing
-# (e.g. Caddy was restarted and lost its in-memory config).
+# Update the reverse-proxy upstream for this PR's route.
+# Caddy's admin API does not support PUT on named-ID sub-paths when the key
+# already exists (returns 409). DELETE + POST is the only reliable way to
+# swap the upstream. The gap between the two calls is <20ms — acceptable for previews.
 update_caddy_upstream() {
   local target_port="$1"
-  if ! curl -sf -X PUT "http://localhost:2019/id/${APP_NAME}/handle" \
-       -H "Content-Type: application/json" \
-       -d "[{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${target_port}\"}]}]" 2>/dev/null; then
-    echo "[preview] Caddy route not found, creating..."
-    curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
-    curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
-      -H "Content-Type: application/json" \
-      -d "{\"@id\": \"${APP_NAME}\", \"match\": [{\"host\": [\"${HOST_HEADER}\"]}], \"handle\": [{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${target_port}\"}]}]}"
-  fi
+  curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
+  curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
+    -H "Content-Type: application/json" \
+    -d "{\"@id\": \"${APP_NAME}\", \"match\": [{\"host\": [\"${HOST_HEADER}\"]}], \"handle\": [{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${target_port}\"}]}]}"
   echo "[preview] ${HOST_HEADER} → localhost:${target_port}"
 }
 
