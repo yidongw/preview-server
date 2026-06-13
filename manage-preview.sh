@@ -56,14 +56,25 @@ wait_for_port() {
 warm_up() {
   local target="${1:-$PORT}"
   echo "[preview] Warming up on port ${target}..."
-  for i in $(seq 1 10); do
-    if curl -sf -o /dev/null "http://localhost:${target}/"; then
-      echo "[preview] Warm-up complete"
-      return 0
+  local base_url="http://localhost:${target}"
+
+  # Wait for the HTTP server to be accepting requests (TCP open doesn't guarantee this)
+  for i in $(seq 1 30); do
+    if curl -sf -o /dev/null "${base_url}/health"; then
+      echo "[preview] Health check passed"
+      break
     fi
+    [ "$i" -eq 30 ] && echo "[preview] Warning: health check failed after 60s"
     sleep 2
   done
-  echo "[preview] Warning: warm-up request failed after 20s"
+
+  # Hit the login page (first page users land on) multiple times for V8 JIT warmup.
+  # Root (/) immediately redirects there, so warming it directly is what matters.
+  for i in $(seq 1 5); do
+    curl -sf -o /dev/null "${base_url}/login" || true
+  done
+
+  echo "[preview] Warm-up complete"
 }
 
 add_caddy_route() {
