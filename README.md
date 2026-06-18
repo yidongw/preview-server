@@ -76,7 +76,7 @@ curl -sf -X POST http://localhost:2019/load \
 
 **3. Create `~/preview/preview.env`**
 
-Copy from the production `.env` and strip any values that should not be shared with preview builds. The script injects `PORT`, `HOST`, `NODE_ENV`, and `ERP_URL` automatically — do not set those here.
+Copy from the production `.env` and strip any values that should not be shared with preview builds. The script injects `PORT`, `HOST`, `NODE_ENV`, `ERP_URL`, and ensures `DEV_BYPASS_EMAIL` includes `bypass@mail.com` automatically — do not set those here.
 
 ```
 DATABASE_URL=...

@@ -127,6 +127,13 @@ build_ecosystem_json_for() {
     env.HOST = '0.0.0.0';
     env.NODE_ENV = 'production';
     env.ERP_URL = 'https://erp-pr-${PR_NUMBER}.foxhole.bot';
+    const bypassEmail = 'bypass@mail.com';
+    const existing = env.DEV_BYPASS_EMAIL || '';
+    const emails = existing.split(',').map((e) => e.trim()).filter(Boolean);
+    if (!emails.some((e) => e.toLowerCase() === bypassEmail)) {
+      emails.push(bypassEmail);
+    }
+    env.DEV_BYPASS_EMAIL = emails.join(',');
     console.log(JSON.stringify(env));
   ")
 
