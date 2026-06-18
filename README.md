@@ -128,4 +128,8 @@ When a push arrives on an open PR, the old process continues serving user traffi
 - During a hot update, two app processes run briefly in parallel (old + new), doubling memory for that PR temporarily.
 - Worktrees share the repo's object store but each gets a full `node_modules` install, so disk usage grows with the number of concurrent PRs.
 - `preview.env` is gitignored and must be provisioned manually on the host.
-- `manage-preview.sh` uses a per-PR file lock (`~/preview/logs/locks/pr-<N>/`) so concurrent invocations for the same PR do not spawn duplicate builds. A second `start` while a deploy is running exits immediately. The GitHub Actions workflow also uses a `concurrency` group to cancel superseded deploys on new pushes.
+- `manage-preview.sh` uses a per-PR file lock (`~/preview/logs/locks/pr-<N>/`) so concurrent invocations for the same PR do not spawn duplicate builds. A second `start` while a deploy is running exits immediately.
+- Only **one build runs globally** at a time. Other PRs wait in a FIFO queue at `~/preview/logs/queues/build/`.
+- At most **10 live previews** (Caddy routes) at once. New PRs build when their build turn arrives, then wait in a FIFO deploy queue at `~/preview/logs/queues/deploy/` until a slot opens.
+- Hot updates for previews that are already live reuse their existing slot and only wait for the global build queue.
+- The GitHub Actions workflow should use a `concurrency` group to cancel superseded deploys on new pushes.
