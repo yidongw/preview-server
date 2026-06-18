@@ -24,9 +24,112 @@ HOST_HEADER="erp-pr-${PR_NUMBER}.foxhole.bot"
 NEXT_PORT=$((PORT + 5000))
 NEXT_APP="${APP_NAME}-next"
 
+# Per-PR lock — prevents concurrent start/stop invocations from spawning
+# duplicate pnpm builds (each can use up to 12 GB RAM).
+LOCK_DIR="${LOGS_PATH}/locks/pr-${PR_NUMBER}"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+release_preview_lock() {
+  rm -rf "$LOCK_DIR"
+}
+
+# Kill orphaned build processes left behind when a previous deploy crashed
+# or was cancelled mid-build.
+cleanup_stale_builds() {
+  [ -d "$WORKTREE" ] || return 0
+  local killed=0 pid
+
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    echo "[preview] Killing stale build pid=${pid}"
+    kill "$pid" 2>/dev/null || true
+    killed=$((killed + 1))
+  done < <(pgrep -f "${WORKTREE}/apps/erp.*react-router/dev/bin.js build" 2>/dev/null || true)
+
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    echo "[preview] Killing stale pnpm build pid=${pid}"
+    kill "$pid" 2>/dev/null || true
+    killed=$((killed + 1))
+  done < <(pgrep -f "pnpm --dir ${WORKTREE}/apps/erp run build" 2>/dev/null || true)
+
+  [ "$killed" -gt 0 ] && echo "[preview] Cleaned up ${killed} stale build process(es)"
+}
+
+# Try to acquire the per-PR lock without blocking.
+# Returns 0 if acquired, 1 if another live instance holds the lock.
+try_preview_lock() {
+  mkdir -p "${LOGS_PATH}/locks"
+
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "${LOCK_DIR}/pid"
+    trap 'release_preview_lock' EXIT INT TERM
+    cleanup_stale_builds
+    return 0
+  fi
+
+  local lock_pid=""
+  [ -f "${LOCK_DIR}/pid" ] && lock_pid=$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)
+
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "[preview] Deploy already in progress for PR #${PR_NUMBER} (pid ${lock_pid}), skipping duplicate invocation"
+    return 1
+  fi
+
+  echo "[preview] Removing stale lock for PR #${PR_NUMBER} (pid ${lock_pid:-unknown})"
+  rm -rf "$LOCK_DIR"
+  cleanup_stale_builds
+
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo $$ > "${LOCK_DIR}/pid"
+    trap 'release_preview_lock' EXIT INT TERM
+    return 0
+  fi
+
+  echo "[preview] Failed to acquire lock for PR #${PR_NUMBER}"
+  return 1
+}
+
+# Block until the per-PR lock is available (used by stop).
+wait_preview_lock() {
+  mkdir -p "${LOGS_PATH}/locks"
+  local waited=0
+  local timeout=7200
+
+  while true; do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo $$ > "${LOCK_DIR}/pid"
+      trap 'release_preview_lock' EXIT INT TERM
+      cleanup_stale_builds
+      return 0
+    fi
+
+    local lock_pid=""
+    [ -f "${LOCK_DIR}/pid" ] && lock_pid=$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)
+
+    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      echo "[preview] Removing stale lock for PR #${PR_NUMBER} (pid ${lock_pid})"
+      rm -rf "$LOCK_DIR"
+      cleanup_stale_builds
+      continue
+    fi
+
+    if [ "$waited" -eq 0 ]; then
+      echo "[preview] Waiting for in-progress deploy on PR #${PR_NUMBER} (pid ${lock_pid:-unknown})..."
+    fi
+
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "[preview] Timed out waiting for lock on PR #${PR_NUMBER} after ${timeout}s"
+      exit 1
+    fi
+
+    sleep 5
+    waited=$((waited + 5))
+  done
+}
 
 # Scan upward from candidate until a port with no listener is found.
 find_free_port() {
@@ -274,6 +377,10 @@ cold_start() {
 # ---------------------------------------------------------------------------
 
 start_preview() {
+  if ! try_preview_lock; then
+    exit 0
+  fi
+
   if [ -d "$WORKTREE" ] && git -C "$WORKTREE" rev-parse HEAD >/dev/null 2>&1 \
      && pm2 show "$APP_NAME" 2>/dev/null | grep -q "online"; then
     hot_update
@@ -283,6 +390,8 @@ start_preview() {
 }
 
 stop_preview() {
+  wait_preview_lock
+
   echo "[preview] Stopping PR #${PR_NUMBER}"
 
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
