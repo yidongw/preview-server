@@ -64,7 +64,9 @@ cleanup_stale_builds() {
     killed=$((killed + 1))
   done < <(pgrep -f "pnpm --dir ${WORKTREE}/apps/erp run build" 2>/dev/null || true)
 
-  [ "$killed" -gt 0 ] && echo "[preview] Cleaned up ${killed} stale build process(es)"
+  if [ "$killed" -gt 0 ]; then
+    echo "[preview] Cleaned up ${killed} stale build process(es)"
+  fi
 }
 
 # Try to acquire the per-PR lock without blocking.
