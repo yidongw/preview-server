@@ -28,6 +28,14 @@ NEXT_APP="${APP_NAME}-next"
 # duplicate pnpm builds (each can use up to 12 GB RAM).
 LOCK_DIR="${LOGS_PATH}/locks/pr-${PR_NUMBER}"
 
+# Global resource limits (override via preview.env or the environment).
+MAX_BUILDS="${PREVIEW_MAX_BUILDS:-1}"
+MAX_PREVIEWS="${PREVIEW_MAX_PREVIEWS:-10}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/preview-queues.sh
+source "${SCRIPT_DIR}/lib/preview-queues.sh"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -209,8 +217,15 @@ update_caddy_upstream() {
 # source lines. PREVIEW_BUILD=1 is read by vite.config.ts to enable sourcemaps
 # without affecting Vercel production deployments.
 build_app() {
+  acquire_global_build_lock
+  local build_failed=0
   echo "[preview] Building (production)..."
-  PREVIEW_BUILD=1 NODE_OPTIONS="--max-old-space-size=12288" pnpm --dir "$WORKTREE/apps/erp" run build
+  PREVIEW_BUILD=1 NODE_OPTIONS="--max-old-space-size=12288" pnpm --dir "$WORKTREE/apps/erp" run build || build_failed=1
+  release_global_build_lock
+  if [ "$build_failed" -ne 0 ]; then
+    echo "[preview] Build failed"
+    exit 1
+  fi
   echo "[preview] Build complete"
 }
 
@@ -353,6 +368,8 @@ cold_start() {
   pnpm --dir "$WORKTREE" lingui:compile
 
   build_app
+
+  acquire_preview_slot
 
   set -a
   # shellcheck source=/dev/null
