@@ -26,7 +26,12 @@ count_live_previews() {
     _count_live_previews
     return
   fi
-  curl -sf http://localhost:2019/config/apps/http/servers/preview/routes 2>/dev/null | node -e "
+  # Fetch routes separately so pipefail doesn't cause || echo 0 to fire when
+  # only curl fails (which would produce two zeros: one from node's catch block
+  # and one from the fallback, making the result "0\n0" — an invalid integer).
+  local routes
+  routes=$(curl -sf http://localhost:2019/config/apps/http/servers/preview/routes 2>/dev/null) || true
+  echo "$routes" | node -e "
     try { console.log(JSON.parse(require('fs').readFileSync(0,'utf8')).length); }
     catch { console.log(0); }
   " 2>/dev/null || echo 0
