@@ -28,12 +28,13 @@ NEXT_APP="${APP_NAME}-next"
 # duplicate pnpm builds (each can use up to 12 GB RAM).
 LOCK_DIR="${LOGS_PATH}/locks/pr-${PR_NUMBER}"
 
-# Global resource limits for the 16 GB preview host.
-MAX_PREVIEWS=10
-BUILD_QUEUE_DIR="${LOGS_PATH}/queues/build"
-DEPLOY_QUEUE_DIR="${LOGS_PATH}/queues/deploy"
-GLOBAL_BUILD_LOCK="${LOGS_PATH}/locks/global-build"
-QUEUE_TICKET=""
+# Global resource limits (override via preview.env or the environment).
+MAX_BUILDS="${PREVIEW_MAX_BUILDS:-1}"
+MAX_PREVIEWS="${PREVIEW_MAX_PREVIEWS:-10}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/preview-queues.sh
+source "${SCRIPT_DIR}/lib/preview-queues.sh"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,134 +42,6 @@ QUEUE_TICKET=""
 
 release_preview_lock() {
   rm -rf "$LOCK_DIR"
-}
-
-count_live_previews() {
-  curl -sf http://localhost:2019/config/apps/http/servers/preview/routes 2>/dev/null | node -e "
-    try { console.log(JSON.parse(require('fs').readFileSync(0,'utf8')).length); }
-    catch { console.log(0); }
-  " 2>/dev/null || echo 0
-}
-
-preview_has_slot() {
-  curl -sf "http://localhost:2019/id/${APP_NAME}" >/dev/null 2>&1
-}
-
-enqueue() {
-  local queue_dir="$1"
-  mkdir -p "$queue_dir"
-  QUEUE_TICKET="${queue_dir}/$(date +%s)-$$-pr${PR_NUMBER}"
-  echo $$ > "$QUEUE_TICKET"
-}
-
-dequeue() {
-  [ -n "$QUEUE_TICKET" ] && rm -f "$QUEUE_TICKET"
-  QUEUE_TICKET=""
-}
-
-# Drop queue tickets whose owner process died without dequeuing.
-cleanup_stale_queue_tickets() {
-  local queue_dir="$1"
-  local f pid
-  for f in "$queue_dir"/*; do
-    [ -f "$f" ] || continue
-    pid=$(head -1 "$f" 2>/dev/null || true)
-    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
-    echo "[preview] Removing stale queue ticket $(basename "$f") (pid ${pid:-unknown})"
-    rm -f "$f"
-  done
-}
-
-queue_position() {
-  local queue_dir="$1"
-  local ticket_name
-  ticket_name=$(basename "$QUEUE_TICKET")
-  local pos=1 f
-  for f in $(ls -1 "$queue_dir" 2>/dev/null | sort); do
-    [ "$f" = "$ticket_name" ] && { echo "$pos"; return; }
-    pos=$((pos + 1))
-  done
-  echo "?"
-}
-
-wait_for_queue_turn() {
-  local queue_dir="$1"
-  local label="$2"
-  local ticket_name waited=0
-  ticket_name=$(basename "$QUEUE_TICKET")
-
-  while true; do
-    cleanup_stale_queue_tickets "$queue_dir"
-    local first
-    first=$(ls -1 "$queue_dir" 2>/dev/null | sort | head -1)
-    if [ "$first" = "$ticket_name" ]; then
-      return 0
-    fi
-    if [ $((waited % 30)) -eq 0 ]; then
-      echo "[preview] ${label} queue position $(queue_position "$queue_dir") for PR #${PR_NUMBER}"
-    fi
-    sleep 5
-    waited=$((waited + 5))
-  done
-}
-
-acquire_global_build_lock() {
-  mkdir -p "${LOGS_PATH}/locks" "$BUILD_QUEUE_DIR"
-  QUEUE_TICKET=""
-  enqueue "$BUILD_QUEUE_DIR"
-  echo "[preview] Waiting for global build slot (1 at a time, PR #${PR_NUMBER})..."
-
-  while true; do
-    wait_for_queue_turn "$BUILD_QUEUE_DIR" "Build"
-
-    if mkdir "$GLOBAL_BUILD_LOCK" 2>/dev/null; then
-      echo $$ > "${GLOBAL_BUILD_LOCK}/pid"
-      echo "$PR_NUMBER" > "${GLOBAL_BUILD_LOCK}/pr"
-      dequeue
-      echo "[preview] Acquired global build slot for PR #${PR_NUMBER}"
-      return 0
-    fi
-
-    local lock_pid=""
-    [ -f "${GLOBAL_BUILD_LOCK}/pid" ] && lock_pid=$(cat "${GLOBAL_BUILD_LOCK}/pid" 2>/dev/null || true)
-    if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-      echo "[preview] Removing stale global build lock (pid ${lock_pid})"
-      rm -rf "$GLOBAL_BUILD_LOCK"
-      continue
-    fi
-    sleep 2
-  done
-}
-
-release_global_build_lock() {
-  rm -rf "$GLOBAL_BUILD_LOCK"
-}
-
-acquire_preview_slot() {
-  if preview_has_slot; then
-    echo "[preview] PR #${PR_NUMBER} already has a preview slot"
-    return 0
-  fi
-
-  mkdir -p "$DEPLOY_QUEUE_DIR"
-  QUEUE_TICKET=""
-  enqueue "$DEPLOY_QUEUE_DIR"
-  echo "[preview] Waiting for preview slot (${MAX_PREVIEWS} max, PR #${PR_NUMBER})..."
-
-  while true; do
-    wait_for_queue_turn "$DEPLOY_QUEUE_DIR" "Deploy"
-
-    local count
-    count=$(count_live_previews)
-    if [ "$count" -lt "$MAX_PREVIEWS" ]; then
-      dequeue
-      echo "[preview] Acquired preview slot for PR #${PR_NUMBER} ($((count + 1))/${MAX_PREVIEWS})"
-      return 0
-    fi
-
-    echo "[preview] Preview slots full (${count}/${MAX_PREVIEWS}), waiting..."
-    sleep 10
-  done
 }
 
 # Kill orphaned build processes left behind when a previous deploy crashed

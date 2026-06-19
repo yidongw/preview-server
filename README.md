@@ -86,6 +86,13 @@ SESSION_SECRET=...
 
 ## Usage
 
+Set capacity limits in `~/preview/preview.env` or the environment before deploys run:
+
+```bash
+PREVIEW_MAX_BUILDS=1    # concurrent pnpm builds (default 1)
+PREVIEW_MAX_PREVIEWS=10 # live Caddy routes (default 10)
+```
+
 ```bash
 # Start (or hot-update) a preview for PR #42 on branch my-feature
 ./manage-preview.sh start 42 my-feature
@@ -113,8 +120,16 @@ Formula: `4000 + PR_NUMBER`
 | File | Purpose |
 |------|---------|
 | `manage-preview.sh` | Main lifecycle script (start / stop) |
+| `lib/preview-queues.sh` | FIFO build/deploy queues and slot limits |
+| `tests/preview-queues.test.sh` | Unit tests for queue behavior |
 | `caddy.json` | Initial Caddy server config loaded at startup |
 | `Caddyfile` | Reference Caddyfile (not used directly; caddy.json is authoritative) |
+
+Run tests:
+
+```bash
+./tests/run.sh
+```
 
 ## Blue-green hot update
 
@@ -129,7 +144,7 @@ When a push arrives on an open PR, the old process continues serving user traffi
 - Worktrees share the repo's object store but each gets a full `node_modules` install, so disk usage grows with the number of concurrent PRs.
 - `preview.env` is gitignored and must be provisioned manually on the host.
 - `manage-preview.sh` uses a per-PR file lock (`~/preview/logs/locks/pr-<N>/`) so concurrent invocations for the same PR do not spawn duplicate builds. A second `start` while a deploy is running exits immediately.
-- Only **one build runs globally** at a time. Other PRs wait in a FIFO queue at `~/preview/logs/queues/build/`.
-- At most **10 live previews** (Caddy routes) at once. New PRs build when their build turn arrives, then wait in a FIFO deploy queue at `~/preview/logs/queues/deploy/` until a slot opens.
+- At most **`PREVIEW_MAX_BUILDS`** (default **1**) builds run globally at once. Other PRs wait in a FIFO queue at `~/preview/logs/queues/build/`.
+- At most **`PREVIEW_MAX_PREVIEWS`** (default **10**) live previews (Caddy routes) at once. New PRs build when a build slot opens, then wait in a FIFO deploy queue at `~/preview/logs/queues/deploy/` until a preview slot opens.
 - Hot updates for previews that are already live reuse their existing slot and only wait for the global build queue.
 - The GitHub Actions workflow should use a `concurrency` group to cancel superseded deploys on new pushes.
