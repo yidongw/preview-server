@@ -3,6 +3,7 @@
 #
 # Required globals before sourcing:
 #   LOGS_PATH, PR_NUMBER, APP_NAME, MAX_BUILDS, MAX_PREVIEWS
+#   PREVIEW_REPO, SCRIPT_DIR  (only needed for reap_closed_previews)
 #
 # Optional test hooks (override before sourcing):
 #   _count_live_previews, _preview_has_route
@@ -156,17 +157,65 @@ release_global_build_lock() {
   fi
 }
 
+# Self-healing slot reclamation.
+#
+# A preview slot is meant to be freed by the `closed`-triggered GitHub Actions
+# teardown, but that is unreliable: if the single self-hosted runner is busy or
+# offline when a PR closes, the queued teardown job is dropped and the slot
+# leaks permanently — eventually filling every slot and deadlocking all deploys
+# (the operation that frees slots is itself stuck behind the full slots).
+#
+# To converge regardless, tear down any live preview whose PR is closed/merged.
+# Only DEFINITIVE closed/merged states trigger teardown; gh/network failures
+# leave the preview untouched, so a transient error never kills a live preview.
+reap_closed_previews() {
+  [ "${PREVIEW_TEST_MODE:-}" = "1" ] && return 0
+  command -v gh >/dev/null 2>&1 || return 0
+
+  local routes ids id pr state reaped=0
+  routes=$(curl -sf "http://localhost:2019/config/apps/http/servers/preview/routes" 2>/dev/null) || return 0
+  ids=$(printf '%s' "$routes" | node -e "
+    try { for (const r of JSON.parse(require('fs').readFileSync(0,'utf8'))) if (r['@id']) console.log(r['@id']); }
+    catch {}
+  " 2>/dev/null) || return 0
+
+  for id in $ids; do
+    case "$id" in
+      erp-pr-*) pr="${id#erp-pr-}" ;;
+      *) continue ;;
+    esac
+    # Never reap the PR we're currently deploying.
+    [ "$pr" = "${PR_NUMBER:-}" ] && continue
+
+    state=$(gh pr view "$pr" --repo "$PREVIEW_REPO" --json state --jq '.state' 2>/dev/null || true)
+    case "$state" in
+      CLOSED | MERGED)
+        echo "[preview] Reaping leaked preview for PR #${pr} (state=${state})"
+        "${SCRIPT_DIR}/manage-preview.sh" stop "$pr" >/dev/null 2>&1 || true
+        reaped=$((reaped + 1))
+        ;;
+    esac
+  done
+
+  [ "$reaped" -gt 0 ] && echo "[preview] Reaped ${reaped} closed-PR preview(s)"
+  return 0
+}
+
 acquire_preview_slot() {
   if preview_has_slot; then
     echo "[preview] PR #${PR_NUMBER} already has a preview slot"
     return 0
   fi
 
+  # Reclaim slots leaked by closed/merged PRs before queueing to wait.
+  reap_closed_previews
+
   mkdir -p "$DEPLOY_QUEUE_DIR"
   QUEUE_TICKET=""
   enqueue "$DEPLOY_QUEUE_DIR"
   echo "[preview] Waiting for preview slot (${MAX_PREVIEWS} max, PR #${PR_NUMBER})..."
 
+  local since_reap=0
   while true; do
     wait_for_queue_turn "$DEPLOY_QUEUE_DIR" "Deploy"
 
@@ -180,5 +229,12 @@ acquire_preview_slot() {
 
     echo "[preview] Preview slots full (${count}/${MAX_PREVIEWS}), waiting..."
     _preview_sleep 10
+    # Re-check for PRs closed during the wait so a freed slot is reclaimed
+    # without manual intervention, roughly once a minute.
+    since_reap=$((since_reap + 10))
+    if [ "$since_reap" -ge 60 ]; then
+      reap_closed_previews
+      since_reap=0
+    fi
   done
 }
