@@ -8,8 +8,8 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:$
 NPM_GLOBAL=$(npm root -g 2>/dev/null)/..
 export PATH="${NPM_GLOBAL}/bin:$PATH"
 
-ACTION="$1"        # start | stop
-PR_NUMBER="$2"     # e.g. 42
+ACTION="$1"        # start | stop | reap
+PR_NUMBER="${2:-0}" # e.g. 42 (not required for reap, which sweeps all)
 BRANCH="${3:-}"    # branch name (only needed for start)
 
 REPO_PATH="/Users/xinjuan/git/carbon"
@@ -31,6 +31,9 @@ LOCK_DIR="${LOGS_PATH}/locks/pr-${PR_NUMBER}"
 # Global resource limits (override via preview.env or the environment).
 MAX_BUILDS="${PREVIEW_MAX_BUILDS:-1}"
 MAX_PREVIEWS="${PREVIEW_MAX_PREVIEWS:-10}"
+
+# Repo previews are built from — used to query PR state when reaping leaked slots.
+PREVIEW_REPO="${PREVIEW_REPO:-yidongw/carbon}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/preview-queues.sh
@@ -432,5 +435,6 @@ stop_preview() {
 case "$ACTION" in
   start) start_preview ;;
   stop)  stop_preview ;;
-  *) echo "Usage: $0 start|stop <pr-number> [branch]"; exit 1 ;;
+  reap)  reap_closed_previews ;;
+  *) echo "Usage: $0 start|stop <pr-number> [branch] | reap"; exit 1 ;;
 esac
