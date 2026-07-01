@@ -20,6 +20,11 @@ APP_NAME="erp-pr-${PR_NUMBER}"
 WORKTREE="${WORKTREE_BASE}/pr-${PR_NUMBER}"
 HOST_HEADER="erp-pr-${PR_NUMBER}.foxhole.bot"
 
+# Optional per-PR env overrides, layered on top of the global preview.env.
+# Lets a single preview differ (e.g. CARBON_EDITION=cloud for one PR) without
+# affecting every other preview. Create /Users/xinjuan/preview/preview.env.<PR>.
+OVERRIDE_ENV="/Users/xinjuan/preview/preview.env.${PR_NUMBER}"
+
 # Temporary port/name used during hot-update blue-green swap
 NEXT_PORT=$((PORT + 5000))
 NEXT_APP="${APP_NAME}-next"
@@ -240,11 +245,16 @@ build_ecosystem_json_for() {
   local env_json
   env_json=$(node -e "
     const fs = require('fs');
-    const lines = fs.readFileSync('/Users/xinjuan/preview/preview.env','utf8').split('\n');
+    // Global preview.env first, then optional per-PR override (override wins).
+    const files = ['/Users/xinjuan/preview/preview.env', '${OVERRIDE_ENV}'];
     const env = {};
-    for (const line of lines) {
-      const m = line.match(/^([A-Z0-9_]+)=(.*)\$/);
-      if (m) env[m[1]] = m[2].replace(/^\"|\"$/g,'').replace(/^'|'\$/g,'');
+    for (const file of files) {
+      let content;
+      try { content = fs.readFileSync(file, 'utf8'); } catch (e) { continue; }
+      for (const line of content.split('\n')) {
+        const m = line.match(/^([A-Z0-9_]+)=(.*)\$/);
+        if (m) env[m[1]] = m[2].replace(/^\"|\"$/g,'').replace(/^'|'\$/g,'');
+      }
     }
     env.PORT = '${target_port}';
     env.HOST = '0.0.0.0';
@@ -379,6 +389,8 @@ cold_start() {
   set -a
   # shellcheck source=/dev/null
   source /Users/xinjuan/preview/preview.env
+  # shellcheck source=/dev/null
+  [ -f "$OVERRIDE_ENV" ] && source "$OVERRIDE_ENV"
   PORT=$((4000 + PR_NUMBER))
   HOST=0.0.0.0
   set +a
