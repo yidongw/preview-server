@@ -33,8 +33,10 @@ count_live_previews() {
   local routes
   routes=$(curl -sf http://localhost:2019/config/apps/http/servers/preview/routes 2>/dev/null) || true
   echo "$routes" | node -e "
-    try { console.log(JSON.parse(require('fs').readFileSync(0,'utf8')).length); }
-    catch { console.log(0); }
+    try {
+      const rs = JSON.parse(require('fs').readFileSync(0,'utf8'));
+      console.log(rs.filter(r => r['@id'] && r['@id'].startsWith('erp-pr-')).length);
+    } catch { console.log(0); }
   " 2>/dev/null || echo 0
 }
 

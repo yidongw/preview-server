@@ -15,19 +15,26 @@ BRANCH="${3:-}"    # branch name (only needed for start)
 REPO_PATH="/Users/xinjuan/git/carbon"
 WORKTREE_BASE="/Users/xinjuan/preview/worktrees"
 LOGS_PATH="/Users/xinjuan/preview/logs"
+
+# ERP — canonical ports 4000+N, blue-green temp 9000+N
 PORT=$((4000 + PR_NUMBER))
 APP_NAME="erp-pr-${PR_NUMBER}"
 WORKTREE="${WORKTREE_BASE}/pr-${PR_NUMBER}"
 HOST_HEADER="erp-pr-${PR_NUMBER}.foxhole.bot"
+NEXT_PORT=$((PORT + 5000))
+NEXT_APP="${APP_NAME}-next"
+
+# MES — canonical ports 5000+N, blue-green temp 8000+N
+MES_PORT=$((5000 + PR_NUMBER))
+MES_APP_NAME="mes-pr-${PR_NUMBER}"
+MES_HOST_HEADER="mes-pr-${PR_NUMBER}.foxhole.bot"
+MES_NEXT_PORT=$((MES_PORT + 3000))
+MES_NEXT_APP="${MES_APP_NAME}-next"
 
 # Optional per-PR env overrides, layered on top of the global preview.env.
 # Lets a single preview differ (e.g. CARBON_EDITION=cloud for one PR) without
 # affecting every other preview. Create /Users/xinjuan/preview/preview.env.<PR>.
 OVERRIDE_ENV="/Users/xinjuan/preview/preview.env.${PR_NUMBER}"
-
-# Temporary port/name used during hot-update blue-green swap
-NEXT_PORT=$((PORT + 5000))
-NEXT_APP="${APP_NAME}-next"
 
 # Per-PR lock — prevents concurrent start/stop invocations from spawning
 # duplicate pnpm builds (each can use up to 12 GB RAM).
@@ -71,6 +78,13 @@ cleanup_stale_builds() {
     kill "$pid" 2>/dev/null || true
     killed=$((killed + 1))
   done < <(pgrep -f "pnpm --dir ${WORKTREE}/apps/erp run build" 2>/dev/null || true)
+
+  while IFS= read -r pid; do
+    [ -z "$pid" ] && continue
+    echo "[preview] Killing stale MES build pid=${pid}"
+    kill "$pid" 2>/dev/null || true
+    killed=$((killed + 1))
+  done < <(pgrep -f "pnpm --dir ${WORKTREE}/apps/mes run build" 2>/dev/null || true)
 
   if [ "$killed" -gt 0 ]; then
     echo "[preview] Cleaned up ${killed} stale build process(es)"
@@ -198,6 +212,10 @@ warm_up() {
   echo "[preview] Warm-up complete"
 }
 
+# ---------------------------------------------------------------------------
+# ERP helpers
+# ---------------------------------------------------------------------------
+
 add_caddy_route() {
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
   curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
@@ -210,7 +228,6 @@ add_caddy_route() {
   echo "[preview] Live at https://${HOST_HEADER}"
 }
 
-# Update the reverse-proxy upstream for this PR's route.
 # Caddy's admin API does not support PUT on named-ID sub-paths when the key
 # already exists (returns 409). DELETE + POST is the only reliable way to
 # swap the upstream. The gap between the two calls is <20ms — acceptable for previews.
@@ -223,20 +240,20 @@ update_caddy_upstream() {
   echo "[preview] ${HOST_HEADER} → localhost:${target_port}"
 }
 
-# Build the app for production with sourcemaps so stack traces point to real
+# Build the ERP app for production with sourcemaps so stack traces point to real
 # source lines. PREVIEW_BUILD=1 is read by vite.config.ts to enable sourcemaps
 # without affecting Vercel production deployments.
 build_app() {
   acquire_global_build_lock
   local build_failed=0
-  echo "[preview] Building (production)..."
+  echo "[preview] Building ERP (production)..."
   PREVIEW_BUILD=1 NODE_OPTIONS="--max-old-space-size=12288" pnpm --dir "$WORKTREE/apps/erp" run build || build_failed=1
   release_global_build_lock
   if [ "$build_failed" -ne 0 ]; then
-    echo "[preview] Build failed"
+    echo "[preview] ERP build failed"
     exit 1
   fi
-  echo "[preview] Build complete"
+  echo "[preview] ERP build complete"
 }
 
 build_ecosystem_json_for() {
@@ -260,6 +277,7 @@ build_ecosystem_json_for() {
     env.HOST = '0.0.0.0';
     env.NODE_ENV = 'production';
     env.ERP_URL = 'https://erp-pr-${PR_NUMBER}.foxhole.bot';
+    env.MES_URL = 'https://mes-pr-${PR_NUMBER}.foxhole.bot';
     const bypassEmail = 'bypass@mail.com';
     const existing = env.DEV_BYPASS_EMAIL || '';
     const emails = existing.split(',').map((e) => e.trim()).filter(Boolean);
@@ -290,16 +308,103 @@ build_ecosystem_json() {
 }
 
 # ---------------------------------------------------------------------------
-# Hot update: zero-downtime blue-green swap
+# MES helpers
+# ---------------------------------------------------------------------------
+
+add_mes_caddy_route() {
+  curl -sf -X DELETE "http://localhost:2019/id/${MES_APP_NAME}" 2>/dev/null || true
+  curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"@id\": \"${MES_APP_NAME}\",
+      \"match\": [{\"host\": [\"${MES_HOST_HEADER}\"]}],
+      \"handle\": [{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${MES_PORT}\"}]}]
+    }"
+  echo "[preview] MES live at https://${MES_HOST_HEADER}"
+}
+
+update_mes_caddy_upstream() {
+  local target_port="$1"
+  curl -sf -X DELETE "http://localhost:2019/id/${MES_APP_NAME}" 2>/dev/null || true
+  curl -sf -X POST "http://localhost:2019/config/apps/http/servers/preview/routes" \
+    -H "Content-Type: application/json" \
+    -d "{\"@id\": \"${MES_APP_NAME}\", \"match\": [{\"host\": [\"${MES_HOST_HEADER}\"]}], \"handle\": [{\"handler\": \"reverse_proxy\", \"upstreams\": [{\"dial\": \"localhost:${target_port}\"}]}]}"
+  echo "[preview] ${MES_HOST_HEADER} → localhost:${target_port}"
+}
+
+build_mes_app() {
+  acquire_global_build_lock
+  local build_failed=0
+  echo "[preview] Building MES (production)..."
+  PREVIEW_BUILD=1 NODE_OPTIONS="--max-old-space-size=12288" pnpm --dir "$WORKTREE/apps/mes" run build || build_failed=1
+  release_global_build_lock
+  if [ "$build_failed" -ne 0 ]; then
+    echo "[preview] MES build failed"
+    exit 1
+  fi
+  echo "[preview] MES build complete"
+}
+
+build_mes_ecosystem_json_for() {
+  local target_port="$1"
+  local app_name="$2"
+  local env_json
+  env_json=$(node -e "
+    const fs = require('fs');
+    // Global preview.env first, then optional per-PR override (override wins).
+    const files = ['/Users/xinjuan/preview/preview.env', '${OVERRIDE_ENV}'];
+    const env = {};
+    for (const file of files) {
+      let content;
+      try { content = fs.readFileSync(file, 'utf8'); } catch (e) { continue; }
+      for (const line of content.split('\n')) {
+        const m = line.match(/^([A-Z0-9_]+)=(.*)\$/);
+        if (m) env[m[1]] = m[2].replace(/^\"|\"$/g,'').replace(/^'|'\$/g,'');
+      }
+    }
+    env.PORT = '${target_port}';
+    env.HOST = '0.0.0.0';
+    env.NODE_ENV = 'production';
+    env.ERP_URL = 'https://erp-pr-${PR_NUMBER}.foxhole.bot';
+    env.MES_URL = 'https://mes-pr-${PR_NUMBER}.foxhole.bot';
+    const bypassEmail = 'bypass@mail.com';
+    const existing = env.DEV_BYPASS_EMAIL || '';
+    const emails = existing.split(',').map((e) => e.trim()).filter(Boolean);
+    if (!emails.some((e) => e.toLowerCase() === bypassEmail)) {
+      emails.push(bypassEmail);
+    }
+    env.DEV_BYPASS_EMAIL = emails.join(',');
+    console.log(JSON.stringify(env));
+  ")
+
+  cat > "${LOGS_PATH}/${app_name}.ecosystem.json" <<ECOSYSTEM
+{
+  "apps": [{
+    "name": "${app_name}",
+    "script": "pnpm",
+    "args": "run start",
+    "cwd": "${WORKTREE}/apps/mes",
+    "out_file": "${LOGS_PATH}/${app_name}.log",
+    "error_file": "${LOGS_PATH}/${app_name}-err.log",
+    "env": ${env_json}
+  }]
+}
+ECOSYSTEM
+}
+
+build_mes_ecosystem_json() {
+  build_mes_ecosystem_json_for "$MES_PORT" "$MES_APP_NAME"
+}
+
+# ---------------------------------------------------------------------------
+# Hot update: zero-downtime blue-green swap for ERP + MES
 #
-# 1. Build new bundle (old process keeps serving traffic throughout)
-# 2. Start new process on NEXT_PORT
-# 3. Wait until NEXT_PORT is ready
-# 4. Switch Caddy upstream to NEXT_PORT (atomic, no gap)
-# 5. Kill old process (traffic already on NEXT_PORT)
-# 6. Start fresh process on canonical PORT, wait until ready
-# 7. Switch Caddy back to canonical PORT
-# 8. Kill temp process
+# 1. Fetch + reset worktree
+# 2. Reinstall deps if lockfile changed
+# 3. Recompile locales if changed
+# 4. Build ERP, then MES (sequential: global build lock limits concurrency)
+# 5. Blue-green swap ERP
+# 6. Blue-green swap MES
 # ---------------------------------------------------------------------------
 
 hot_update() {
@@ -330,9 +435,9 @@ hot_update() {
   fi
 
   build_app
+  build_mes_app
 
-  # Start new process on temp port; old process continues serving traffic.
-  # Kill any stale temp process first, then find a port that's actually free.
+  # --- Blue-green swap ERP ---
   pm2 delete "$NEXT_APP" 2>/dev/null || true
   NEXT_PORT=$(find_free_port "$NEXT_PORT")
   build_ecosystem_json_for "$NEXT_PORT" "$NEXT_APP"
@@ -340,23 +445,41 @@ hot_update() {
   wait_for_port "$NEXT_PORT"
   warm_up "$NEXT_PORT"
 
-  # Switch Caddy only after new process is confirmed ready — zero downtime
   update_caddy_upstream "$NEXT_PORT"
 
-  # Old process is no longer receiving traffic; tear it down
   pm2 stop "$APP_NAME" 2>/dev/null || true
   pm2 delete "$APP_NAME" 2>/dev/null || true
 
-  # Migrate to canonical port so port assignments stay deterministic
   build_ecosystem_json_for "$PORT" "$APP_NAME"
   pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
   wait_for_port "$PORT"
   warm_up "$PORT"
   update_caddy_upstream "$PORT"
 
-  # Temp process is no longer receiving traffic; clean it up
   pm2 stop "$NEXT_APP" 2>/dev/null || true
   pm2 delete "$NEXT_APP" 2>/dev/null || true
+
+  # --- Blue-green swap MES ---
+  pm2 delete "$MES_NEXT_APP" 2>/dev/null || true
+  MES_NEXT_PORT=$(find_free_port "$MES_NEXT_PORT")
+  build_mes_ecosystem_json_for "$MES_NEXT_PORT" "$MES_NEXT_APP"
+  pm2 start "${LOGS_PATH}/${MES_NEXT_APP}.ecosystem.json"
+  wait_for_port "$MES_NEXT_PORT"
+  warm_up "$MES_NEXT_PORT"
+
+  update_mes_caddy_upstream "$MES_NEXT_PORT"
+
+  pm2 stop "$MES_APP_NAME" 2>/dev/null || true
+  pm2 delete "$MES_APP_NAME" 2>/dev/null || true
+
+  build_mes_ecosystem_json_for "$MES_PORT" "$MES_APP_NAME"
+  pm2 start "${LOGS_PATH}/${MES_APP_NAME}.ecosystem.json"
+  wait_for_port "$MES_PORT"
+  warm_up "$MES_PORT"
+  update_mes_caddy_upstream "$MES_PORT"
+
+  pm2 stop "$MES_NEXT_APP" 2>/dev/null || true
+  pm2 delete "$MES_NEXT_APP" 2>/dev/null || true
 
   echo "[preview] Hot update complete"
 }
@@ -366,7 +489,7 @@ hot_update() {
 # ---------------------------------------------------------------------------
 
 cold_start() {
-  echo "[preview] Cold start PR #${PR_NUMBER} on port ${PORT} (branch: ${BRANCH})"
+  echo "[preview] Cold start PR #${PR_NUMBER} on ports ERP:${PORT} MES:${MES_PORT} (branch: ${BRANCH})"
 
   git -C "$REPO_PATH" worktree prune 2>/dev/null || true
   if [ -d "$WORKTREE" ]; then
@@ -383,6 +506,7 @@ cold_start() {
   pnpm --dir "$WORKTREE" lingui:compile
 
   build_app
+  build_mes_app
 
   acquire_preview_slot
 
@@ -392,18 +516,29 @@ cold_start() {
   # shellcheck source=/dev/null
   [ -f "$OVERRIDE_ENV" ] && source "$OVERRIDE_ENV"
   PORT=$((4000 + PR_NUMBER))
+  MES_PORT=$((5000 + PR_NUMBER))
   HOST=0.0.0.0
   set +a
 
+  # Start ERP
   pm2 stop "$APP_NAME" 2>/dev/null || true
   pm2 delete "$APP_NAME" 2>/dev/null || true
-
   build_ecosystem_json
   pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
 
-  wait_for_port
-  warm_up
+  # Start MES
+  pm2 stop "$MES_APP_NAME" 2>/dev/null || true
+  pm2 delete "$MES_APP_NAME" 2>/dev/null || true
+  build_mes_ecosystem_json
+  pm2 start "${LOGS_PATH}/${MES_APP_NAME}.ecosystem.json"
+
+  wait_for_port "$PORT"
+  warm_up "$PORT"
   add_caddy_route
+
+  wait_for_port "$MES_PORT"
+  warm_up "$MES_PORT"
+  add_mes_caddy_route
 }
 
 # ---------------------------------------------------------------------------
@@ -428,12 +563,21 @@ stop_preview() {
 
   echo "[preview] Stopping PR #${PR_NUMBER}"
 
+  # Remove Caddy routes
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
+  curl -sf -X DELETE "http://localhost:2019/id/${MES_APP_NAME}" 2>/dev/null || true
 
+  # Stop ERP processes
   pm2 stop "$APP_NAME" 2>/dev/null || true
   pm2 delete "$APP_NAME" 2>/dev/null || true
   pm2 stop "$NEXT_APP" 2>/dev/null || true
   pm2 delete "$NEXT_APP" 2>/dev/null || true
+
+  # Stop MES processes
+  pm2 stop "$MES_APP_NAME" 2>/dev/null || true
+  pm2 delete "$MES_APP_NAME" 2>/dev/null || true
+  pm2 stop "$MES_NEXT_APP" 2>/dev/null || true
+  pm2 delete "$MES_NEXT_APP" 2>/dev/null || true
 
   git -C "$REPO_PATH" worktree prune 2>/dev/null || true
   if [ -d "$WORKTREE" ]; then
