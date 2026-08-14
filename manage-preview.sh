@@ -450,6 +450,7 @@ hot_update() {
   pm2 stop "$APP_NAME" 2>/dev/null || true
   pm2 delete "$APP_NAME" 2>/dev/null || true
 
+  PORT=$(find_free_port "$PORT")
   build_ecosystem_json_for "$PORT" "$APP_NAME"
   pm2 start "${LOGS_PATH}/${APP_NAME}.ecosystem.json"
   wait_for_port "$PORT"
@@ -472,6 +473,7 @@ hot_update() {
   pm2 stop "$MES_APP_NAME" 2>/dev/null || true
   pm2 delete "$MES_APP_NAME" 2>/dev/null || true
 
+  MES_PORT=$(find_free_port "$MES_PORT")
   build_mes_ecosystem_json_for "$MES_PORT" "$MES_APP_NAME"
   pm2 start "${LOGS_PATH}/${MES_APP_NAME}.ecosystem.json"
   wait_for_port "$MES_PORT"
@@ -519,6 +521,15 @@ cold_start() {
   MES_PORT=$((5000 + PR_NUMBER))
   HOST=0.0.0.0
   set +a
+
+  PORT=$(find_free_port "$PORT")
+  MES_PORT=$(find_free_port "$MES_PORT")
+  if [ "$PORT" -ne $((4000 + PR_NUMBER)) ]; then
+    echo "[preview] Warning: ERP canonical port $((4000 + PR_NUMBER)) occupied, using ${PORT}"
+  fi
+  if [ "$MES_PORT" -ne $((5000 + PR_NUMBER)) ]; then
+    echo "[preview] Warning: MES canonical port $((5000 + PR_NUMBER)) occupied, using ${MES_PORT}"
+  fi
 
   # Start ERP
   pm2 stop "$APP_NAME" 2>/dev/null || true
