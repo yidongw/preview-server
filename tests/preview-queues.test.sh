@@ -218,7 +218,30 @@ test_release_frees_build_slot() {
   assert_eq "0" "$(count_active_builds)" "slot should be released after build"
 }
 
+test_find_free_port_skips_occupied() {
+  find_free_port() {
+    local candidate="$1"
+    while nc -z localhost "$candidate" 2>/dev/null; do
+      candidate=$((candidate + 1))
+    done
+    echo "$candidate"
+  }
+
+  local base_port=48732
+  nc -l "$base_port" >/dev/null 2>&1 &
+  local listener_pid=$!
+  sleep 0.1
+
+  local result
+  result=$(find_free_port "$base_port")
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+
+  assert_eq "$((base_port + 1))" "$result" "find_free_port should skip occupied port and return next free one"
+}
+
 echo "Running preview queue tests..."
+test_find_free_port_skips_occupied
 test_fifo_queue_order
 test_single_build_slot_blocks_second
 test_max_builds_allows_two_concurrent
