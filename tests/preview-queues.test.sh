@@ -218,6 +218,72 @@ test_release_frees_build_slot() {
   assert_eq "0" "$(count_active_builds)" "slot should be released after build"
 }
 
+test_evicts_oldest_preview_when_full() {
+  export LOGS_PATH="${TMP_ROOT}/evict-oldest"
+  export MAX_BUILDS=1
+  export MAX_PREVIEWS=2
+  local evicted_pr=""
+  local live_count=2
+  _count_live_previews() { echo "$live_count"; }
+  _preview_has_route() { return 1; }
+  _evict_oldest_preview() {
+    evicted_pr="$1"
+    live_count=$((live_count - 1))
+    rm -f "$PREVIEW_SLOTS_DIR"/*-pr"${evicted_pr}" 2>/dev/null || true
+  }
+  mkdir -p "$LOGS_PATH"
+
+  export PR_NUMBER=100
+  export APP_NAME="erp-pr-100"
+  source_queues
+  mkdir -p "$PREVIEW_SLOTS_DIR"
+
+  # Two older previews already deployed; PR 55 is oldest.
+  touch "${PREVIEW_SLOTS_DIR}/1000000000-pr55"
+  touch "${PREVIEW_SLOTS_DIR}/2000000000-pr66"
+
+  acquire_preview_slot
+
+  assert_eq "55" "$evicted_pr" "should evict the oldest preview (PR #55)"
+  assert_eq "0" "$(ls -1 "$DEPLOY_QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')" "deploy ticket should be dequeued after acquiring slot"
+  assert_eq "2" "$(ls -1 "$PREVIEW_SLOTS_DIR" 2>/dev/null | wc -l | tr -d ' ')" "PR 55 record gone; PR 66 and PR 100 records remain"
+}
+
+test_record_unrecord_preview_slot() {
+  export LOGS_PATH="${TMP_ROOT}/record-slot"
+  export MAX_BUILDS=1
+  export MAX_PREVIEWS=10
+  export PR_NUMBER=200
+  export APP_NAME="erp-pr-200"
+  mkdir -p "$LOGS_PATH"
+  source_queues
+
+  record_preview_slot
+  assert_eq "1" "$(ls -1 "$PREVIEW_SLOTS_DIR" 2>/dev/null | wc -l | tr -d ' ')" "slot record should exist after record"
+
+  unrecord_preview_slot
+  assert_eq "0" "$(ls -1 "$PREVIEW_SLOTS_DIR" 2>/dev/null | wc -l | tr -d ' ')" "slot record should be gone after unrecord"
+}
+
+test_no_eviction_when_no_tracked_previews() {
+  export LOGS_PATH="${TMP_ROOT}/evict-fallback"
+  export MAX_BUILDS=1
+  export MAX_PREVIEWS=1
+  local live_count=1
+  _count_live_previews() { echo "$live_count"; }
+  _preview_has_route() { return 1; }
+  mkdir -p "$LOGS_PATH"
+
+  export PR_NUMBER=300
+  export APP_NAME="erp-pr-300"
+  source_queues
+
+  # No slot records exist — evict_oldest_preview should return 1.
+  local result=0
+  evict_oldest_preview || result=$?
+  assert_eq "1" "$result" "evict_oldest_preview should return 1 when no tracked previews"
+}
+
 echo "Running preview queue tests..."
 test_fifo_queue_order
 test_single_build_slot_blocks_second
@@ -228,6 +294,9 @@ test_existing_route_skips_deploy_queue
 test_stale_queue_ticket_removed
 test_stale_build_slot_removed
 test_release_frees_build_slot
+test_evicts_oldest_preview_when_full
+test_record_unrecord_preview_slot
+test_no_eviction_when_no_tracked_previews
 
 echo
 echo "Tests run: ${TESTS}, failures: ${FAILURES}"
