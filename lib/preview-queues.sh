@@ -6,11 +6,12 @@
 #   PREVIEW_REPO, SCRIPT_DIR  (only needed for reap_closed_previews)
 #
 # Optional test hooks (override before sourcing):
-#   _count_live_previews, _preview_has_route
+#   _count_live_previews, _preview_has_route, _evict_oldest_preview
 
 BUILD_QUEUE_DIR="${LOGS_PATH}/queues/build"
 DEPLOY_QUEUE_DIR="${LOGS_PATH}/queues/deploy"
 BUILD_SLOTS_DIR="${LOGS_PATH}/locks/build-slots"
+PREVIEW_SLOTS_DIR="${LOGS_PATH}/preview-slots"
 QUEUE_TICKET=""
 OUR_BUILD_SLOT=""
 
@@ -203,6 +204,65 @@ reap_closed_previews() {
   return 0
 }
 
+# Record that this PR has a live preview slot (call when slot is acquired).
+record_preview_slot() {
+  mkdir -p "$PREVIEW_SLOTS_DIR"
+  rm -f "$PREVIEW_SLOTS_DIR"/*-pr"${PR_NUMBER}" 2>/dev/null || true
+  touch "${PREVIEW_SLOTS_DIR}/$(date +%s)-pr${PR_NUMBER}"
+}
+
+# Remove the preview slot record for this PR (call from stop_preview).
+unrecord_preview_slot() {
+  rm -f "$PREVIEW_SLOTS_DIR"/*-pr"${PR_NUMBER}" 2>/dev/null || true
+}
+
+# Remove stale slot records whose caddy routes no longer exist.
+cleanup_stale_preview_slots() {
+  [ "${PREVIEW_TEST_MODE:-}" = "1" ] && return 0
+  [ -d "$PREVIEW_SLOTS_DIR" ] || return 0
+  local f pr
+  for f in "$PREVIEW_SLOTS_DIR"/*; do
+    [ -f "$f" ] || continue
+    pr="${f##*-pr}"
+    if ! curl -sf "http://localhost:2019/id/erp-pr-${pr}" >/dev/null 2>&1; then
+      echo "[preview] Removing stale preview slot record for PR #${pr}"
+      rm -f "$f"
+    fi
+  done
+}
+
+# Return the PR number of the oldest tracked preview, excluding current PR.
+find_oldest_preview_pr() {
+  cleanup_stale_preview_slots
+  [ -d "$PREVIEW_SLOTS_DIR" ] || return 0
+  local f pr
+  for f in $(ls -1 "$PREVIEW_SLOTS_DIR" 2>/dev/null | sort); do
+    pr="${f##*-pr}"
+    [ "$pr" = "$PR_NUMBER" ] && continue
+    echo "$pr"
+    return
+  done
+}
+
+# Evict the oldest tracked preview to free a slot for the current PR.
+# Returns 1 if no evictable preview was found.
+evict_oldest_preview() {
+  local oldest_pr
+  oldest_pr=$(find_oldest_preview_pr)
+  if [ -z "$oldest_pr" ]; then
+    return 1
+  fi
+  echo "[preview] Evicting oldest preview PR #${oldest_pr} to make room for PR #${PR_NUMBER}"
+  if declare -f _evict_oldest_preview >/dev/null 2>&1; then
+    _evict_oldest_preview "$oldest_pr"
+  else
+    "${SCRIPT_DIR}/manage-preview.sh" stop "$oldest_pr" >/dev/null 2>&1 || true
+  fi
+  # Ensure the record is removed even if stop didn't clean it up.
+  rm -f "$PREVIEW_SLOTS_DIR"/*-pr"${oldest_pr}" 2>/dev/null || true
+  return 0
+}
+
 acquire_preview_slot() {
   if preview_has_slot; then
     echo "[preview] PR #${PR_NUMBER} already has a preview slot"
@@ -225,18 +285,24 @@ acquire_preview_slot() {
     count=$(count_live_previews)
     if [ "$count" -lt "$MAX_PREVIEWS" ]; then
       dequeue
+      record_preview_slot
       echo "[preview] Acquired preview slot for PR #${PR_NUMBER} ($((count + 1))/${MAX_PREVIEWS})"
       return 0
     fi
 
-    echo "[preview] Preview slots full (${count}/${MAX_PREVIEWS}), waiting..."
-    _preview_sleep 10
-    # Re-check for PRs closed during the wait so a freed slot is reclaimed
-    # without manual intervention, roughly once a minute.
-    since_reap=$((since_reap + 10))
-    if [ "$since_reap" -ge 60 ]; then
-      reap_closed_previews
-      since_reap=0
+    # Slots are full — evict the oldest tracked preview rather than wait.
+    echo "[preview] Preview slots full (${count}/${MAX_PREVIEWS}), evicting oldest preview..."
+    if evict_oldest_preview; then
+      _preview_sleep 2
+    else
+      # No tracked preview to evict; fall back to periodic reap-and-wait.
+      echo "[preview] No tracked previews to evict, waiting..."
+      _preview_sleep 10
+      since_reap=$((since_reap + 10))
+      if [ "$since_reap" -ge 60 ]; then
+        reap_closed_previews
+        since_reap=0
+      fi
     fi
   done
 }

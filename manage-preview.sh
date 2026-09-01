@@ -562,6 +562,7 @@ stop_preview() {
   wait_preview_lock
 
   echo "[preview] Stopping PR #${PR_NUMBER}"
+  unrecord_preview_slot
 
   # Remove Caddy routes
   curl -sf -X DELETE "http://localhost:2019/id/${APP_NAME}" 2>/dev/null || true
