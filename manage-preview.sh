@@ -15,6 +15,11 @@ BRANCH="${3:-}"    # branch name (only needed for start)
 REPO_PATH="/Users/xinjuan/git/carbon"
 WORKTREE_BASE="/Users/xinjuan/preview/worktrees"
 LOGS_PATH="/Users/xinjuan/preview/logs"
+# Share pnpm's virtual store across all preview worktrees (npm packages; not workspace symlinks).
+PREVIEW_SHARED_DIR="${PREVIEW_SHARED_DIR:-/Users/xinjuan/preview/shared}"
+PREVIEW_VIRTUAL_STORE="${PREVIEW_VIRTUAL_STORE:-${PREVIEW_SHARED_DIR}/.pnpm}"
+mkdir -p "$PREVIEW_VIRTUAL_STORE"
+export npm_config_virtual_store_dir="$PREVIEW_VIRTUAL_STORE"
 
 # ERP — canonical ports 4000+N, blue-green temp 9000+N
 PORT=$((4000 + PR_NUMBER))
@@ -57,6 +62,22 @@ source "${SCRIPT_DIR}/lib/preview-queues.sh"
 
 release_preview_lock() {
   rm -rf "$LOCK_DIR"
+}
+
+# pnpm install for a preview worktree. Uses a shared virtual store so npm packages
+# are not duplicated per PR. Workspace packages (@carbon/*) still link to this
+# worktree's packages/ — each worktree needs its own node_modules shell.
+install_worktree_deps() {
+  local wt="$1"
+  local reason="${2:-install}"
+
+  if [ ! -f "$wt/pnpm-lock.yaml" ]; then
+    echo "[preview] No pnpm-lock.yaml in ${wt}, skipping install"
+    return 0
+  fi
+
+  echo "[preview] pnpm install (${reason}), shared virtual-store=${PREVIEW_VIRTUAL_STORE}"
+  pnpm --dir "$wt" install --prefer-offline
 }
 
 # Kill orphaned build processes left behind when a previous deploy crashed
@@ -421,8 +442,7 @@ hot_update() {
   NEW_LOCK=$(git -C "$WORKTREE" rev-parse HEAD:pnpm-lock.yaml 2>/dev/null || echo "")
 
   if [ "$OLD_LOCK" != "$NEW_LOCK" ]; then
-    echo "[preview] Dependencies changed, running pnpm install"
-    pnpm --dir "$WORKTREE" install --prefer-offline
+    install_worktree_deps "$WORKTREE" "lockfile changed"
   else
     echo "[preview] Dependencies unchanged, skipping pnpm install"
   fi
@@ -500,7 +520,7 @@ cold_start() {
   git -C "$REPO_PATH" fetch origin "${BRANCH}"
   git -C "$REPO_PATH" worktree add "$WORKTREE" "FETCH_HEAD"
 
-  pnpm --dir "$WORKTREE" install --prefer-offline
+  install_worktree_deps "$WORKTREE" "cold start"
 
   # Compile locale catalogs (.mjs files are gitignored, absent in fresh worktrees)
   pnpm --dir "$WORKTREE" lingui:compile

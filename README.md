@@ -141,7 +141,7 @@ When a push arrives on an open PR, the old process continues serving user traffi
 
 - The server must have enough RAM to hold multiple production builds simultaneously. The build step sets `--max-old-space-size=12288` (12 GB).
 - During a hot update, two app processes run briefly in parallel (old + new), doubling memory for that PR temporarily.
-- Worktrees share the repo's object store but each gets a full `node_modules` install, so disk usage grows with the number of concurrent PRs.
+- Worktrees share the repo object store and a **shared pnpm virtual store** (`~/preview/shared/.pnpm` by default). Each PR still has its own `node_modules` shell (workspace symlinks to that worktree's `packages/`), so `du` per worktree can look large while npm packages are not fully duplicated.
 - `preview.env` is gitignored and must be provisioned manually on the host.
 - `manage-preview.sh` uses a per-PR file lock (`~/preview/logs/locks/pr-<N>/`) so concurrent invocations for the same PR do not spawn duplicate builds. A second `start` while a deploy is running exits immediately.
 - At most **`PREVIEW_MAX_BUILDS`** (default **1**) builds run globally at once. Other PRs wait in a FIFO queue at `~/preview/logs/queues/build/`.
