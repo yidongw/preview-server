@@ -1,0 +1,3 @@
+#!/bin/sh
+# Install a separate root-owned launcher/config for each project. No request-provided paths.
+exec /usr/bin/python3 -I /opt/preview-server/docker/preview.py --config /etc/preview-server/project.json request
