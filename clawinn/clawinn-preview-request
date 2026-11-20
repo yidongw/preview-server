@@ -1,0 +1,3 @@
+#!/bin/sh
+# Install root-owned; SSH must force this exact command, never SSH_ORIGINAL_COMMAND.
+exec /usr/bin/python3 -I /opt/preview-server/clawinn/preview.py --config /etc/clawinn-preview/config.json request
