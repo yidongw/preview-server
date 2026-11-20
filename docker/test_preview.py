@@ -358,6 +358,15 @@ class ManagerTests(unittest.TestCase):
         receipt = read_json(self.manager.pr_root / 'receipt.json')
         self.assertTrue(receipt['cleanupRequired'])
 
+    def test_internal_health_sends_configured_host_header(self):
+        response = Mock(status=200, headers={'X-Preview-App-Sha': SHA})
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        self.manager.opener.open = Mock(return_value=response)
+        self.manager.wait_health('http://172.24.0.2:8080/api/health', host='pr-42.preview.example.com')
+        sent = self.manager.opener.open.call_args.args[0]
+        self.assertEqual(sent.get_header('Host'), 'pr-42.preview.example.com')
+
     def test_public_health_requires_app_sha_and_route_sha(self):
         response = Mock(status=200, headers={'X-Preview-App-Sha': SHA, 'X-Preview-Sha': SHA})
         response.__enter__ = Mock(return_value=response)
@@ -394,7 +403,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('APP_ORIGIN=https://pr-42.preview.example.com', run_args)
         self.assertIn('ADMIN_ORIGIN=https://pr-42.preview-admin.example.com', run_args)
         self.assertIn('PREVIEW_PORT=8080', run_args)
-        self.manager.wait_health.assert_called_once_with('http://172.24.0.2:8080/api/health')
+        self.manager.wait_health.assert_called_once_with('http://172.24.0.2:8080/api/health', host='pr-42.preview.example.com')
 
     def test_buildx_ls_selects_exact_named_builder_from_json_lines(self):
         builder = dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
