@@ -445,7 +445,7 @@ class Manager:
             if endpoint.get('originEnv'):
                 environment[endpoint['originEnv']] = origins[endpoint['name']]
         env_args = [arg for key, value in environment.items() for arg in ('--env', key + '=' + value)]
-        args = ['run', '-d', '--name', name, '--network', name, *self.sandbox(),
+        args = ['run', '-d', '--name', name, '--restart', 'unless-stopped', '--network', name, *self.sandbox(),
                 '--label', 'preview-server.managed=true', '--label', 'preview-server.sha=' + self.request['sha'],
                 *self.mount(data, '/preview'),
                 *self.mount(data / self.c['secretsDirectory'], '/preview/' + self.c['secretsDirectory'], True),

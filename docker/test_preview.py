@@ -396,6 +396,7 @@ class ManagerTests(unittest.TestCase):
         run_args = self.manager.docker.call_args_list[1].args
         self.assertIn('--internal', network_args)
         self.assertNotIn('--publish', run_args)
+        self.assertEqual(run_args[run_args.index('--restart') + 1], 'unless-stopped')
         self.assertIn('PREVIEW_SHA=' + SHA, run_args)
         self.assertTrue(any('target=/preview/secrets,readonly' in arg for arg in run_args))
         self.assertIn('no-new-privileges:true', run_args)
