@@ -466,14 +466,16 @@ class Manager:
         require(any(ip in subnet for subnet in subnets), 'runtime address is outside its network')
         require(not any(details['NetworkSettings'].get('Ports', {}).values()), 'runtime ports must not be published')
         upstream = '%s:%s' % (ip, self.c['port'])
-        self.wait_health('http://%s%s' % (upstream, self.c['healthPath']))
+        host = next(iter(self.urls().values())).removeprefix('https://')
+        self.wait_health('http://%s%s' % (upstream, self.c['healthPath']), host=host)
         return upstream
 
-    def wait_health(self, url, sha_header=False):
+    def wait_health(self, url, sha_header=False, host=None):
         deadline = time.monotonic() + self.c['healthTimeout']
+        request = urllib.request.Request(url, headers={'Host': host} if host else {})
         while True:
             try:
-                with self.opener.open(url, timeout=5) as response:
+                with self.opener.open(request, timeout=5) as response:
                     good = response.status == 200 and response.headers.get(self.c['revisionHeader']) == self.request['sha']
                     if sha_header:
                         good = good and response.headers.get('X-Preview-Sha') == self.request['sha']
