@@ -88,27 +88,54 @@ def validate_request(value, repository):
 
 def config_from(path):
     config = read_json(path)
-    defaults = dict(root='/srv/clawinn-preview', repository='cyl19970726/TokenToEarn',
-                    storefrontDomain='preview.clawinn.xyz', adminDomain='preview-admin.clawinn.xyz',
-                    caddyAdmin='http://127.0.0.1:2019', caddyServer='clawinn_preview', maxPreviews=6,
-                    docker='docker', git='git', builder='clawinn-preview', builderContainer='clawinn-preview-buildkit', builderEndpoint='tcp://127.0.0.1:1234', buildMemory=4294967296,
+    defaults = dict(caddyAdmin='http://127.0.0.1:2019', caddyServer='previews', maxPreviews=6,
+                    docker='docker', git='git', builder='preview', builderContainer='preview-buildkit',
+                    builderEndpoint='tcp://127.0.0.1:1234', buildMemory=4294967296,
                     buildCpuQuota=200000, buildCpuPeriod=100000, minFreeBytes=10737418240,
                     dockerDataRoot='/var/lib/docker', memory='768m', cpus='1', pids=128,
                     uid=1000, gid=1000, port=8080, healthTimeout=90, commandTimeout=1800,
-                    dockerfile='deploy/tokyo/Dockerfile')
+                    baseBranch='main', buildTarget='runtime', healthPath='/api/health',
+                    revisionHeader='X-Preview-App-Sha', runtimeEnv={}, secretsDirectory='secrets',
+                    provenanceFile='secrets/synthetic.json', descriptorFile='secrets/schema.json',
+                    descriptorFields=['formatVersion', 'sourceHash', 'migrations', 'schemaHash'],
+                    forbiddenHosts=[], controlHostMarker='/run/preview-control-host')
     defaults.update(config)
     config = defaults
-    require(config['repository'] == 'cyl19970726/TokenToEarn', 'unsupported repository')
+    require(isinstance(config.get('repository'), str) and
+            re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', config['repository']), 'invalid repository')
+    require(isinstance(config.get('project'), str) and re.fullmatch(r'[a-z][a-z0-9-]{0,39}', config['project']), 'invalid project namespace')
     for field in ('root', 'sourceRepo', 'dockerDataRoot'):
         require(isinstance(config.get(field), str) and Path(config[field]).is_absolute(), 'invalid config path: ' + field)
-    for field in ('storefrontDomain', 'adminDomain'):
-        require(re.fullmatch(r'[a-z0-9]+(?:[.-][a-z0-9]+)*', config[field]) and '.' in config[field], 'invalid domain')
-    require(config['storefrontDomain'] != config['adminDomain'], 'domains must differ')
-    require(re.fullmatch('[a-zA-Z0-9_-]+', config['caddyServer']), 'invalid Caddy server')
-    require(re.fullmatch('[a-zA-Z0-9_-]+', config['builder']), 'invalid builder')
+    endpoints = config.get('endpoints')
+    require(isinstance(endpoints, list) and 0 < len(endpoints) <= 20, 'endpoints are required')
+    names, domains = set(), set()
+    for endpoint in endpoints:
+        require(isinstance(endpoint, dict) and set(endpoint) <= {'name', 'domain', 'originEnv'}, 'invalid endpoint')
+        name, domain = endpoint.get('name'), endpoint.get('domain')
+        require(isinstance(name, str) and re.fullmatch(r'[a-z][a-z0-9_-]*', name) and name not in names, 'invalid or duplicate endpoint name')
+        require(isinstance(domain, str) and re.fullmatch(r'[a-z0-9]+(?:[.-][a-z0-9]+)*', domain) and '.' in domain and domain not in domains, 'invalid or duplicate endpoint domain')
+        names.add(name)
+        domains.add(domain)
+        if 'originEnv' in endpoint:
+            require(re.fullmatch(r'[A-Z_][A-Z0-9_]*', endpoint['originEnv']), 'invalid origin environment name')
+    for field in ('caddyServer', 'builder'):
+        require(isinstance(config[field], str) and re.fullmatch('[a-zA-Z0-9_-]+', config[field]), 'invalid ' + field)
     require(re.fullmatch(r'http://127\.0\.0\.1:[0-9]+', config['caddyAdmin']), 'Caddy admin must be loopback')
     for field in ('maxPreviews', 'buildMemory', 'buildCpuQuota', 'buildCpuPeriod', 'minFreeBytes', 'uid', 'gid', 'pids', 'port', 'healthTimeout', 'commandTimeout'):
         require(type(config[field]) is int and config[field] > 0, 'invalid positive limit: ' + field)
+    for field in ('dockerfile', 'secretsDirectory', 'provenanceFile', 'descriptorFile'):
+        value = config.get(field)
+        require(isinstance(value, str) and value and not value.startswith('/') and
+                '..' not in Path(value).parts and Path(value).as_posix() == value and ',' not in value, 'invalid relative path: ' + field)
+    for field in ('helperCommand', 'serveCommand'):
+        command = config.get(field)
+        require(isinstance(command, list) and command and all(isinstance(arg, str) and arg and '\0' not in arg for arg in command), field + ' is required')
+    require(isinstance(config['runtimeEnv'], dict) and all(re.fullmatch(r'[A-Z_][A-Z0-9_]*', key) and isinstance(value, str) for key, value in config['runtimeEnv'].items()), 'invalid runtime environment')
+    require(isinstance(config['healthPath'], str) and config['healthPath'].startswith('/') and not config['healthPath'].startswith('//'), 'invalid health path')
+    require(isinstance(config['revisionHeader'], str) and re.fullmatch(r'[A-Za-z][A-Za-z0-9-]*', config['revisionHeader']), 'invalid revision header')
+    require(isinstance(config['descriptorFields'], list) and config['descriptorFields'] and all(isinstance(field, str) for field in config['descriptorFields']), 'invalid descriptor fields')
+    require(isinstance(config['forbiddenHosts'], list) and all(isinstance(host, str) for host in config['forbiddenHosts']), 'invalid forbidden hosts')
+    require(isinstance(config['controlHostMarker'], str) and Path(config['controlHostMarker']).is_absolute(), 'invalid control host marker')
     return config
 
 
@@ -152,7 +179,7 @@ class Manager:
             raise PreviewError('HTTP request failed') from None
 
     def github_current(self, *, stopping=False):
-        headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'clawinn-preview-manager',
+        headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'preview-server',
                    'X-GitHub-Api-Version': '2022-11-28'}
         if self.c.get('githubTokenFile'):
             token = Path(self.c['githubTokenFile']).read_text().strip()
@@ -167,21 +194,29 @@ class Manager:
         if stopping:
             return
         require(value.get('head', {}).get('repo', {}).get('full_name') == self.c['repository'], 'fork PRs are not allowed')
-        require(value.get('base', {}).get('ref') == 'main', 'PR must target main')
+        require(value.get('base', {}).get('ref') == self.c['baseBranch'], 'PR targets an unsupported base branch')
         actual = [label['name'] for label in value.get('labels', [])]
         require(database_mode(actual) == database_mode(self.request['labels']), 'database labels changed')
 
     def fetch_current(self):
         repo = self.c['sourceRepo']
         self.run([self.c['git'], '--git-dir', repo, 'fetch', '--no-tags', 'origin',
-                  '+refs/pull/%s/head:refs/clawinn/pr-%s' % (self.pr, self.pr)])
+                  '+refs/pull/%s/head:refs/previews/%s/pr-%s' % (self.pr, self.c['project'], self.pr)])
         sha = self.run([self.c['git'], '--git-dir', repo, 'rev-parse', '--verify',
-                        'refs/clawinn/pr-%s^{commit}' % self.pr])
+                        'refs/previews/%s/pr-%s^{commit}' % (self.c['project'], self.pr)])
         require(sha == self.request['sha'], 'stale PR SHA')
 
+    @property
+    def resource_prefix(self):
+        return 'preview-%s-pr-' % self.c['project']
+
+    @property
+    def resource_name(self):
+        return self.resource_prefix + str(self.pr)
+
     def urls(self):
-        return ('https://pr-%s.%s' % (self.pr, self.c['storefrontDomain']),
-                'https://pr-%s.%s' % (self.pr, self.c['adminDomain']))
+        return {endpoint['name']: 'https://pr-%s.%s' % (self.pr, endpoint['domain'])
+                for endpoint in self.c['endpoints']}
 
     def event(self, state, **fields):
         record = dict(time=int(time.time()), state=state, prNumber=self.pr, sha=self.request['sha'], **fields)
@@ -200,19 +235,19 @@ class Manager:
         return self.root / ('pr-%s' % self.pr)
 
     def routes(self, upstream=None):
-        hosts = [url.removeprefix('https://') for url in self.urls()]
-        return {'@id': 'clawinn-pr-%s' % self.pr, 'match': [{'host': hosts}],
-                'handle': [{'handler': 'headers', 'response': {'set': {'X-Clawinn-Preview-Sha': [self.request['sha']]}}},
+        hosts = [url.removeprefix('https://') for url in self.urls().values()]
+        return {'@id': self.resource_name, 'match': [{'host': hosts}],
+                'handle': [{'handler': 'headers', 'response': {'set': {'X-Preview-Sha': [self.request['sha']]}}},
                            {'handler': 'reverse_proxy', 'upstreams': [{'dial': upstream}]}],
                 'terminal': True}
 
     def update_route(self, upstream=None):
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
         routes = self.http(endpoint) or []
-        route_id = 'clawinn-pr-%s' % self.pr
+        route_id = self.resource_name
         routes = [route for route in routes if route.get('@id') != route_id]
         if upstream is not None:
-            live = sum(str(route.get('@id', '')).startswith('clawinn-pr-') for route in routes)
+            live = sum(str(route.get('@id', '')).startswith(self.resource_prefix) for route in routes)
             require(live < self.c['maxPreviews'], 'preview capacity reached')
             routes.insert(0, self.routes(upstream))
         # PATCH replaces an existing key; PUT creates and rejects existing routes with HTTP 409.
@@ -221,8 +256,8 @@ class Manager:
     def check_capacity(self):
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
         routes = self.http(endpoint) or []
-        own = 'clawinn-pr-%s' % self.pr
-        live = sum(str(route.get('@id', '')).startswith('clawinn-pr-') and route.get('@id') != own for route in routes)
+        own = self.resource_name
+        live = sum(str(route.get('@id', '')).startswith(self.resource_prefix) and route.get('@id') != own for route in routes)
         require(live < self.c['maxPreviews'], 'preview capacity reached')
 
     def build(self):
@@ -248,14 +283,14 @@ class Manager:
         require(quota > 0 and period > 0 and quota / period <= self.c['buildCpuQuota'] / self.c['buildCpuPeriod'],
                 'builder CPU must be bounded')
         # Git archive emits a tar stream; no PR paths or source are extracted on this host.
-        image = 'clawinn-preview:pr-%s-%s' % (self.pr, self.request['sha'])
+        image = 'preview-%s:pr-%s-%s' % (self.c['project'], self.pr, self.request['sha'])
         self.build_context(image)
         return image
 
     def build_context(self, image):
         git_args = [self.c['git'], '--git-dir', self.c['sourceRepo'], 'archive', '--format=tar', self.request['sha']]
         docker_args = [self.c['docker'], 'buildx', 'build', '--builder', self.c['builder'], '--load',
-                       '--target', 'runtime', '--file', self.c['dockerfile'],
+                       '--target', self.c['buildTarget'], '--file', self.c['dockerfile'],
                        '--build-arg', 'GIT_COMMIT=' + self.request['sha'], '--tag', image, '-']
         env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
                'HOME': str(self.root / 'home'), 'GIT_TERMINAL_PROMPT': '0'}
@@ -295,7 +330,7 @@ class Manager:
                 '--pids-limit', str(self.c['pids']), '--cpus', str(self.c['cpus']), '--memory', self.c['memory'],
                 '--memory-swap', self.c['memory'], '--tmpfs', '/tmp:rw,noexec,nosuid,size=64m',
                 '--log-driver', 'local', '--log-opt', 'max-size=5m', '--log-opt', 'max-file=2',
-                '--env', 'PREVIEW_ROOT=/preview', '--env', 'TTE_WORKER_ENABLED=0']
+                '--env', 'PREVIEW_ROOT=/preview']
 
     @staticmethod
     def mount(path, target, readonly=False):
@@ -311,7 +346,7 @@ class Manager:
             # Only an already trusted previous image may create SQLite sidecars for a private backup.
             # The configured shared synthetic source always remains a fully read-only mount.
             args += self.mount(source, '/source', not source_sidecars)
-        args += ['--entrypoint', 'node', image, 'deploy/preview/app.cjs', command]
+        args += ['--entrypoint', self.c['helperCommand'][0], image, *self.c['helperCommand'][1:], command]
         if command == 'copy':
             args += ['--from', '/source', '--to', '/preview']
         return self.docker(*args, json_output=(command == 'schema'))
@@ -320,17 +355,17 @@ class Manager:
         require(self.c.get('syntheticRoot'), 'syntheticRoot is not configured')
         source = Path(self.c['syntheticRoot'])
         require(source.is_absolute() and source.is_dir() and not source.is_symlink(), 'invalid synthetic source')
-        require((source / 'secrets/synthetic.json').is_file(), 'synthetic source marker missing')
+        require((source / self.c['provenanceFile']).is_file(), 'synthetic source marker missing')
         require(self.c.get('devBaseline') and Path(self.c['devBaseline']).is_absolute(), 'devBaseline is not configured')
         baseline = read_json(self.c['devBaseline'])
-        current = read_json(source / 'secrets/schema.json')
+        current = read_json(source / self.c['descriptorFile'])
         require(baseline == current, 'development baseline changed')
-        for field in ('formatVersion', 'sourceHash', 'migrations', 'schemaHash'):
+        for field in self.c['descriptorFields']:
             require(field in descriptor and descriptor[field] == baseline.get(field), 'development schema mismatch')
         return source
 
     def stop_app(self):
-        name = 'clawinn-pr-%s' % self.pr
+        name = self.resource_name
         # Inspect before removing; avoid ignoring daemon or permissions failures.
         existing = self.docker('ps', '-a', '--filter', 'name=^/' + name + '$', '--format', '{{.Names}}')
         if existing:
@@ -338,7 +373,7 @@ class Manager:
             self.docker('rm', name)
 
     def remove_network(self):
-        name = 'clawinn-pr-%s' % self.pr
+        name = self.resource_name
         networks = self.docker('network', 'ls', '--filter', 'name=^' + name + '$', '--format', '{{.Name}}')
         if networks:
             self.docker('network', 'rm', name)
@@ -386,19 +421,21 @@ class Manager:
         return data
 
     def start_app(self, image, data, mode):
-        name = 'clawinn-pr-%s' % self.pr
+        name = self.resource_name
         self.remove_network()
-        self.docker('network', 'create', '--internal', '--driver', 'bridge', '--label', 'clawinn.preview=true', name)
-        storefront, admin = self.urls()
+        self.docker('network', 'create', '--internal', '--driver', 'bridge', '--label', 'preview-server.managed=true', name)
+        origins = self.urls()
+        environment = {**self.c['runtimeEnv'], 'PREVIEW_SHA': self.request['sha'],
+                       'PREVIEW_DATABASE_MODE': mode, 'PREVIEW_PORT': str(self.c['port'])}
+        for endpoint in self.c['endpoints']:
+            if endpoint.get('originEnv'):
+                environment[endpoint['originEnv']] = origins[endpoint['name']]
+        env_args = [arg for key, value in environment.items() for arg in ('--env', key + '=' + value)]
         args = ['run', '-d', '--name', name, '--network', name, *self.sandbox(),
-                '--label', 'clawinn.preview=true', '--label', 'clawinn.sha=' + self.request['sha'],
+                '--label', 'preview-server.managed=true', '--label', 'preview-server.sha=' + self.request['sha'],
                 *self.mount(data, '/preview'),
-                *self.mount(data / 'secrets', '/preview/secrets', True),
-                '--env', 'PREVIEW_SHA=' + self.request['sha'],
-                '--env', 'TTE_ALLOWED_ORIGIN=' + storefront, '--env', 'TTE_MANAGEMENT_ORIGIN=' + admin,
-                '--env', 'TTE_PORT=' + str(self.c['port']), '--env', 'TTE_LISTEN_HOST=0.0.0.0',
-                '--env', 'PREVIEW_DATABASE_MODE=' + mode,
-                '--entrypoint', 'node', image, 'deploy/preview/app.cjs', 'serve']
+                *self.mount(data / self.c['secretsDirectory'], '/preview/' + self.c['secretsDirectory'], True),
+                *env_args, '--entrypoint', self.c['serveCommand'][0], image, *self.c['serveCommand'][1:]]
         self.docker(*args)
         details = self.docker('inspect', name, json_output=True)[0]
         expected = self.docker('image', 'inspect', image, json_output=True)[0]['Id']
@@ -415,7 +452,7 @@ class Manager:
         require(any(ip in subnet for subnet in subnets), 'runtime address is outside its network')
         require(not any(details['NetworkSettings'].get('Ports', {}).values()), 'runtime ports must not be published')
         upstream = '%s:%s' % (ip, self.c['port'])
-        self.wait_health('http://%s/api/health' % upstream)
+        self.wait_health('http://%s%s' % (upstream, self.c['healthPath']))
         return upstream
 
     def wait_health(self, url, sha_header=False):
@@ -423,9 +460,9 @@ class Manager:
         while True:
             try:
                 with self.opener.open(url, timeout=5) as response:
-                    good = response.status == 200 and response.headers.get('X-Clawinn-App-Sha') == self.request['sha']
+                    good = response.status == 200 and response.headers.get(self.c['revisionHeader']) == self.request['sha']
                     if sha_header:
-                        good = good and response.headers.get('X-Clawinn-Preview-Sha') == self.request['sha']
+                        good = good and response.headers.get('X-Preview-Sha') == self.request['sha']
                     if good:
                         return
             except OSError:
@@ -436,7 +473,7 @@ class Manager:
 
     def handle(self, request):
         mode = validate_request(request, self.c['repository'])
-        require(socket.gethostname() not in ('cx43', 'cx43-grab') and not Path('/run/clawinn-control-host').exists(),
+        require(socket.gethostname() not in self.c['forbiddenHosts'] and not Path(self.c['controlHostMarker']).exists(),
                 'builds are forbidden on the control host')
         self.request, self.pr = request, request['prNumber']
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -484,11 +521,10 @@ class Manager:
                 self.github_current()
                 self.fetch_current()
                 self.update_route(upstream)
-                storefront, admin = self.urls()
-                for url in (storefront, admin):
-                    self.wait_health(url + '/api/health', sha_header=True)
-                return self.event('ready', image=image, upstream=upstream, databaseMode=mode,
-                                  storefrontUrl=storefront, adminUrl=admin)
+                urls = self.urls()
+                for url in urls.values():
+                    self.wait_health(url + self.c['healthPath'], sha_header=True)
+                return self.event('ready', image=image, upstream=upstream, databaseMode=mode, urls=urls)
             except Exception:
                 if disruptive:
                     # Try every cleanup even if Caddy is unavailable. Never restart an old image

@@ -1,6 +1,9 @@
 # preview-server
 
-Config and scripts for spinning up per-PR preview environments of the ERP app on a self-hosted Mac server.
+Tools for self-hosted per-PR preview environments.
+
+- [Generic Linux/Docker manager](docker/README.md): configure repositories, named endpoints, application adapters and persistent data modes.
+- Existing Carbon Mac/PM2 workflow: documented below.
 
 Each open PR gets its own isolated build running on a dedicated port, served at `https://erp-pr-<PR>.foxhole.bot` via Caddy.
 

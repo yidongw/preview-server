@@ -1,4 +1,4 @@
-"""Run with python3 -m unittest discover -s clawinn -p 'test_*.py'. No Docker/host access."""
+"""Run with python3 -m unittest discover -s docker -p 'test_*.py'. No Docker/host access."""
 import copy
 import importlib.util
 import json
@@ -14,7 +14,7 @@ preview = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preview)
 SHA = 'a' * 40
 OTHER = 'b' * 40
-REPO = 'cyl19970726/TokenToEarn'
+REPO = 'example/widgets'
 DESCRIPTOR = dict(formatVersion=1, sourceHash='source', migrations=['001'], schemaHash='schema')
 
 
@@ -36,7 +36,10 @@ class ManagerTests(unittest.TestCase):
         config_path = self.root / 'config.json'
         config_path.write_text(json.dumps(dict(root=str(self.root), sourceRepo=str(self.root / 'bare'),
                                                uid=os.getuid() or 1000, gid=os.getgid() or 1000,
-                                               dockerDataRoot=str(self.root))))
+                                               dockerDataRoot=str(self.root), repository=REPO, project='widgets', dockerfile='Dockerfile',
+                                               helperCommand=['python3', '/app/preview.py'], serveCommand=['python3', '/app/preview.py', 'serve'],
+                                               endpoints=[dict(name='web', domain='preview.example.com', originEnv='APP_ORIGIN'), dict(name='admin', domain='preview-admin.example.com', originEnv='ADMIN_ORIGIN')],
+                                               forbiddenHosts=['control-host'])))
         self.config = preview.config_from(config_path)
         self.manager = preview.Manager(self.config)
         self.manager.request, self.manager.pr = request(), 42
@@ -107,7 +110,7 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(preview.PreviewError, 'stale'):
             self.manager.fetch_current()
         args = self.manager.run.call_args_list[0].args[0]
-        self.assertIn('+refs/pull/42/head:refs/clawinn/pr-42', args)
+        self.assertIn('+refs/pull/42/head:refs/previews/widgets/pr-42', args)
         self.assertNotIn('checkout', args)
 
     def test_stale_before_build_leaves_old_application(self):
@@ -236,22 +239,22 @@ class ManagerTests(unittest.TestCase):
 
     def test_route_replacement_preserves_other_routes_and_sets_sha(self):
         other = dict(**{'@id': 'unrelated'}, handle=[])
-        self.manager.http = Mock(side_effect=[[other, {'@id': 'clawinn-pr-42'}], None])
+        self.manager.http = Mock(side_effect=[[other, {'@id': 'preview-widgets-pr-42'}], None])
         self.manager.update_route('172.24.0.2:8080')
         kwargs = self.manager.http.call_args.kwargs
         self.assertEqual(kwargs['method'], 'PATCH')
         routes = kwargs['body']
         self.assertEqual(routes[1], other)
         route = routes[0]
-        self.assertEqual(route['match'][0]['host'], ['pr-42.preview.clawinn.xyz', 'pr-42.preview-admin.clawinn.xyz'])
-        self.assertEqual(route['handle'][0]['response']['set']['X-Clawinn-Preview-Sha'], [SHA])
+        self.assertEqual(route['match'][0]['host'], ['pr-42.preview.example.com', 'pr-42.preview-admin.example.com'])
+        self.assertEqual(route['handle'][0]['response']['set']['X-Preview-Sha'], [SHA])
         self.assertEqual(route['handle'][1]['upstreams'], [dict(dial='172.24.0.2:8080')])
 
     def test_capacity_counts_previews_and_updates_reuse_own_slot(self):
         self.manager.c['maxPreviews'] = 1
-        self.manager.http = Mock(return_value=[{'@id': 'clawinn-pr-42'}, {'@id': 'unrelated'}])
+        self.manager.http = Mock(return_value=[{'@id': 'preview-widgets-pr-42'}, {'@id': 'unrelated'}])
         self.manager.check_capacity()
-        self.manager.http.return_value = [{'@id': 'clawinn-pr-43'}]
+        self.manager.http.return_value = [{'@id': 'preview-widgets-pr-43'}]
         with self.assertRaisesRegex(preview.PreviewError, 'capacity'):
             self.manager.check_capacity()
 
@@ -285,7 +288,7 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn('secret', str(caught.exception))
 
     def test_no_build_on_control_host(self):
-        with patch.object(preview.socket, 'gethostname', return_value='cx43-grab'):
+        with patch.object(preview.socket, 'gethostname', return_value='control-host'):
             with self.assertRaisesRegex(preview.PreviewError, 'control host'):
                 self.manager.handle(request())
 
@@ -349,25 +352,25 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(receipt['cleanupRequired'])
 
     def test_public_health_requires_app_sha_and_route_sha(self):
-        response = Mock(status=200, headers={'X-Clawinn-App-Sha': SHA, 'X-Clawinn-Preview-Sha': SHA})
+        response = Mock(status=200, headers={'X-Preview-App-Sha': SHA, 'X-Preview-Sha': SHA})
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         self.manager.opener.open = Mock(return_value=response)
-        self.manager.wait_health('https://pr-42.preview.clawinn.xyz/api/health', sha_header=True)
-        for missing in ('X-Clawinn-App-Sha', 'X-Clawinn-Preview-Sha'):
+        self.manager.wait_health('https://pr-42.preview.example.com/api/health', sha_header=True)
+        for missing in ('X-Preview-App-Sha', 'X-Preview-Sha'):
             with self.subTest(missing=missing):
-                response.headers = {'X-Clawinn-App-Sha': SHA, 'X-Clawinn-Preview-Sha': SHA}
+                response.headers = {'X-Preview-App-Sha': SHA, 'X-Preview-Sha': SHA}
                 response.headers[missing] = OTHER
                 with patch.object(preview.time, 'monotonic', side_effect=[0, 999]):
                     with self.assertRaisesRegex(preview.PreviewError, 'health'):
-                        self.manager.wait_health('https://pr-42.preview.clawinn.xyz/api/health', sha_header=True)
+                        self.manager.wait_health('https://pr-42.preview.example.com/api/health', sha_header=True)
 
     def test_web_sandbox_internal_network_secret_mount_and_identity(self):
         data = self.root / 'runtime-data'
         (data / 'secrets').mkdir(parents=True)
         expected_image = dict(Id='sha256:expected')
         details = dict(Image='sha256:expected', NetworkSettings=dict(Ports={'8080/tcp': None},
-                       Networks={'clawinn-pr-42': {'IPAddress': '172.24.0.2'}}))
+                       Networks={'preview-widgets-pr-42': {'IPAddress': '172.24.0.2'}}))
         network = dict(Internal=True, Driver='bridge', IPAM=dict(Config=[dict(Subnet='172.24.0.0/16')]))
         self.manager.remove_network = Mock()
         self.manager.wait_health = Mock()
@@ -380,7 +383,10 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('PREVIEW_SHA=' + SHA, run_args)
         self.assertTrue(any('target=/preview/secrets,readonly' in arg for arg in run_args))
         self.assertIn('no-new-privileges:true', run_args)
-        self.assertEqual(run_args[-2:], ('deploy/preview/app.cjs', 'serve'))
+        self.assertEqual(run_args[-2:], ('/app/preview.py', 'serve'))
+        self.assertIn('APP_ORIGIN=https://pr-42.preview.example.com', run_args)
+        self.assertIn('ADMIN_ORIGIN=https://pr-42.preview-admin.example.com', run_args)
+        self.assertIn('PREVIEW_PORT=8080', run_args)
         self.manager.wait_health.assert_called_once_with('http://172.24.0.2:8080/api/health')
 
     def test_buildx_ls_selects_exact_named_builder_from_json_lines(self):
@@ -394,19 +400,43 @@ class ManagerTests(unittest.TestCase):
     def test_runtime_rejects_noninternal_network_extra_attachment_and_published_port(self):
         data = self.root / 'runtime-data'
         (data / 'secrets').mkdir(parents=True)
-        good = dict(Image='image-id', NetworkSettings=dict(Ports={'8080/tcp': None}, Networks={'clawinn-pr-42': {'IPAddress': '172.24.0.2'}}))
+        good = dict(Image='image-id', NetworkSettings=dict(Ports={'8080/tcp': None}, Networks={'preview-widgets-pr-42': {'IPAddress': '172.24.0.2'}}))
         network = dict(Internal=True, Driver='bridge', IPAM=dict(Config=[dict(Subnet='172.24.0.0/16')]))
         for kind in ('external', 'extra-network', 'public-ip', 'outside-subnet', 'published'):
             details, net = copy.deepcopy(good), copy.deepcopy(network)
             if kind == 'external': net['Internal'] = False
             if kind == 'extra-network': details['NetworkSettings']['Networks']['bridge'] = {'IPAddress': '172.17.0.2'}
-            if kind == 'public-ip': details['NetworkSettings']['Networks']['clawinn-pr-42']['IPAddress'] = '8.8.8.8'
-            if kind == 'outside-subnet': details['NetworkSettings']['Networks']['clawinn-pr-42']['IPAddress'] = '172.25.0.2'
+            if kind == 'public-ip': details['NetworkSettings']['Networks']['preview-widgets-pr-42']['IPAddress'] = '8.8.8.8'
+            if kind == 'outside-subnet': details['NetworkSettings']['Networks']['preview-widgets-pr-42']['IPAddress'] = '172.25.0.2'
             if kind == 'published': details['NetworkSettings']['Ports']['8080/tcp'] = [dict(HostIp='0.0.0.0', HostPort='8080')]
             self.manager.remove_network = Mock()
             self.manager.docker = Mock(side_effect=['network', 'container', [details], [dict(Id='image-id')], [net]])
             with self.subTest(kind=kind), self.assertRaises(preview.PreviewError):
                 self.manager.start_app('candidate', data, 'isolated')
+
+    def test_project_namespace_and_named_endpoints_are_configured(self):
+        self.assertEqual(self.manager.resource_name, 'preview-widgets-pr-42')
+        self.manager.c['project'] = 'reports'
+        self.assertEqual(self.manager.resource_name, 'preview-reports-pr-42')
+        self.manager.c['endpoints'] = [dict(name='dashboard', domain='reports.example.net')]
+        self.assertEqual(self.manager.urls(), {'dashboard': 'https://pr-42.reports.example.net'})
+        self.assertEqual(self.manager.routes('172.24.0.2:8080')['match'][0]['host'], ['pr-42.reports.example.net'])
+
+    def test_configuration_requires_repository_adapter_and_rejects_unsafe_paths(self):
+        for field in ('repository', 'project', 'endpoints', 'dockerfile', 'helperCommand', 'serveCommand'):
+            value = dict(self.config)
+            del value[field]
+            target = self.root / 'bad.json'
+            target.write_text(json.dumps(value))
+            with self.subTest(missing=field), self.assertRaises(preview.PreviewError):
+                preview.config_from(target)
+        for change in ({'dockerfile': '../Dockerfile'}, {'helperCommand': 'sh -c bad'},
+                       {'project': '../other'}, {'repository': 'other;command'},
+                       {'endpoints': [dict(name='web', domain='bad/domain')]}):
+            target = self.root / 'bad.json'
+            target.write_text(json.dumps({**self.config, **change}))
+            with self.subTest(change=change), self.assertRaises(preview.PreviewError):
+                preview.config_from(target)
 
     def test_durable_receipt_journal_no_secret_fields(self):
         self.manager.event('ready', port=49152)
