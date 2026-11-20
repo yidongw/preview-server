@@ -399,7 +399,7 @@ class ManagerTests(unittest.TestCase):
     def test_buildx_ls_selects_exact_named_builder_from_json_lines(self):
         builder = dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
         info = dict(Config=dict(User='1000:1000'), HostConfig=dict(Memory=1024, CpuQuota=100000, CpuPeriod=100000, Privileged=False))
-        self.manager.docker = Mock(side_effect=[json.dumps(dict(Name='default', Driver='docker')) + '\n' + json.dumps(builder), [info]])
+        self.manager.docker = Mock(side_effect=[json.dumps(dict(Name='default', Driver='docker')) + '\n' + json.dumps(builder) + '\n' + json.dumps(builder), [info]])
         self.manager.build_context = Mock()
         self.manager.build()
         self.assertEqual(self.manager.docker.call_args_list[0].args, ('buildx', 'ls', '--format', '{{json .}}'))

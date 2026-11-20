@@ -280,7 +280,9 @@ class Manager:
             builders = [json.loads(line) for line in records.splitlines() if line.strip()]
         except (ValueError, AttributeError):
             raise PreviewError('invalid builder listing') from None
-        matches = [item for item in builders if item.get('Name') == self.c['builder']]
+        # Some buildx installations repeat identical records for discovered contexts.
+        unique = {json.dumps(item, sort_keys=True): item for item in builders if item.get('Name') == self.c['builder']}
+        matches = list(unique.values())
         require(len(matches) == 1, 'configured builder is missing or ambiguous')
         builder = matches[0]
         require(builder.get('Driver') == 'remote' and len(builder.get('Nodes', [])) == 1
