@@ -69,6 +69,13 @@ class ManagerTests(unittest.TestCase):
                 preview.validate_request({**request(), **changes}, REPO)
         self.assertEqual(preview.validate_request(request(), REPO), 'isolated')
 
+    def test_ephemeral_credential_accepts_token_punctuation_but_no_controls(self):
+        for token in ('ghs_' + 'x' * 40, 'eyJ.test-token_payload.signature+/='):
+            self.assertEqual(preview.validate_request({**request(), 'githubToken': token}, REPO), 'isolated')
+        for token in ('x' * 30 + '\r\nInjected: value', 'x' * 30 + '\x00', 'x' * 30 + ' ', 'short'):
+            with self.subTest(token_length=len(token)), self.assertRaises(preview.PreviewError):
+                preview.validate_request({**request(), 'githubToken': token}, REPO)
+
     def test_database_conflict_and_reset_shared_exclusion(self):
         with self.assertRaisesRegex(preview.PreviewError, 'conflicting'):
             preview.validate_request(request(labels=['preview:db-isolated', 'preview:db-dev-copy']), REPO)
@@ -392,7 +399,7 @@ class ManagerTests(unittest.TestCase):
     def test_buildx_ls_selects_exact_named_builder_from_json_lines(self):
         builder = dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
         info = dict(Config=dict(User='1000:1000'), HostConfig=dict(Memory=1024, CpuQuota=100000, CpuPeriod=100000, Privileged=False))
-        self.manager.docker = Mock(side_effect=[json.dumps(dict(Name='default', Driver='docker')) + '\n' + json.dumps(builder), [info]])
+        self.manager.docker = Mock(side_effect=[json.dumps(dict(Name='default', Driver='docker')) + '\n' + json.dumps(builder) + '\n' + json.dumps(builder), [info]])
         self.manager.build_context = Mock()
         self.manager.build()
         self.assertEqual(self.manager.docker.call_args_list[0].args, ('buildx', 'ls', '--format', '{{json .}}'))

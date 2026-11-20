@@ -75,7 +75,7 @@ def validate_request(value, repository):
                            {'repository', 'prNumber', 'sha', 'action', 'labels', 'githubToken'}), 'unexpected request fields')
     if 'githubToken' in value:
         require(isinstance(value['githubToken'], str) and 20 <= len(value['githubToken']) <= 4096
-                and re.fullmatch(r'[A-Za-z0-9_]+', value['githubToken']), 'invalid GitHub credential')
+                and re.fullmatch(r'[\x21-\x7e]+', value['githubToken']), 'invalid GitHub credential')
     require(value['repository'] == repository, 'repository is not allowed')
     require(type(value['prNumber']) is int and 0 < value['prNumber'] < 2**31, 'invalid PR number')
     require(isinstance(value['sha'], str) and re.fullmatch('[0-9a-f]{40}', value['sha']), 'invalid SHA')
@@ -280,7 +280,9 @@ class Manager:
             builders = [json.loads(line) for line in records.splitlines() if line.strip()]
         except (ValueError, AttributeError):
             raise PreviewError('invalid builder listing') from None
-        matches = [item for item in builders if item.get('Name') == self.c['builder']]
+        # Some buildx installations repeat identical records for discovered contexts.
+        unique = {json.dumps(item, sort_keys=True): item for item in builders if item.get('Name') == self.c['builder']}
+        matches = list(unique.values())
         require(len(matches) == 1, 'configured builder is missing or ambiguous')
         builder = matches[0]
         require(builder.get('Driver') == 'remote' and len(builder.get('Nodes', [])) == 1
