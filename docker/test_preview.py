@@ -69,6 +69,13 @@ class ManagerTests(unittest.TestCase):
                 preview.validate_request({**request(), **changes}, REPO)
         self.assertEqual(preview.validate_request(request(), REPO), 'isolated')
 
+    def test_ephemeral_credential_accepts_token_punctuation_but_no_controls(self):
+        for token in ('ghs_' + 'x' * 40, 'eyJ.test-token_payload.signature+/='):
+            self.assertEqual(preview.validate_request({**request(), 'githubToken': token}, REPO), 'isolated')
+        for token in ('x' * 30 + '\r\nInjected: value', 'x' * 30 + '\x00', 'x' * 30 + ' ', 'short'):
+            with self.subTest(token_length=len(token)), self.assertRaises(preview.PreviewError):
+                preview.validate_request({**request(), 'githubToken': token}, REPO)
+
     def test_database_conflict_and_reset_shared_exclusion(self):
         with self.assertRaisesRegex(preview.PreviewError, 'conflicting'):
             preview.validate_request(request(labels=['preview:db-isolated', 'preview:db-dev-copy']), REPO)

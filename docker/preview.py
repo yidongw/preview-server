@@ -75,7 +75,7 @@ def validate_request(value, repository):
                            {'repository', 'prNumber', 'sha', 'action', 'labels', 'githubToken'}), 'unexpected request fields')
     if 'githubToken' in value:
         require(isinstance(value['githubToken'], str) and 20 <= len(value['githubToken']) <= 4096
-                and re.fullmatch(r'[A-Za-z0-9_]+', value['githubToken']), 'invalid GitHub credential')
+                and re.fullmatch(r'[\x21-\x7e]+', value['githubToken']), 'invalid GitHub credential')
     require(value['repository'] == repository, 'repository is not allowed')
     require(type(value['prNumber']) is int and 0 < value['prNumber'] < 2**31, 'invalid PR number')
     require(isinstance(value['sha'], str) and re.fullmatch('[0-9a-f]{40}', value['sha']), 'invalid SHA')
