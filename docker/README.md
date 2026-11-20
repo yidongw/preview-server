@@ -18,6 +18,8 @@ python3 -I /opt/preview-server/docker/preview.py --config /etc/preview-server/wi
 
 Actions are `deploy`, `stop`, `reset-db`, and `refresh-dev-copy`. Requests cannot choose paths, commands, environment, domains, repositories outside the configured allowlist, or credentials. The trusted caller must verify repository write permission; never give deployment credentials to PR code or fork workflows.
 
+A trusted GitHub Actions caller may include `githubToken` containing its short-lived repository-scoped Actions token. It travels only over the authenticated SSH stdin, stays in manager memory, and is supplied solely to GitHub metadata requests and the Git fetch subprocess environment. It is never written to config, journal, receipt, command-line arguments, build context or runtime environment. This avoids provisioning a long-lived host token. Omit it to use operator-configured host credentials.
+
 The manager independently checks live PR state, same-repository head, configured base branch, SHA and database labels. It fetches the exact pull ref, builds only that pushed commit, and repeats checks before publishing. GitHub read failures fail closed. No extra enable label is required.
 
 Ready responses contain named endpoint URLs:

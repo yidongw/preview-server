@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Trusted Linux entry point. PR source runs only in constrained Docker containers."""
 import argparse
+import base64
 import contextlib
 import ipaddress
 import fcntl
@@ -70,7 +71,11 @@ def database_mode(labels):
 
 def validate_request(value, repository):
     require(isinstance(value, dict), 'request must be an object')
-    require(set(value) == {'repository', 'prNumber', 'sha', 'action', 'labels'}, 'unexpected request fields')
+    require(set(value) in ({'repository', 'prNumber', 'sha', 'action', 'labels'},
+                           {'repository', 'prNumber', 'sha', 'action', 'labels', 'githubToken'}), 'unexpected request fields')
+    if 'githubToken' in value:
+        require(isinstance(value['githubToken'], str) and 20 <= len(value['githubToken']) <= 4096
+                and re.fullmatch(r'[A-Za-z0-9_]+', value['githubToken']), 'invalid GitHub credential')
     require(value['repository'] == repository, 'repository is not allowed')
     require(type(value['prNumber']) is int and 0 < value['prNumber'] < 2**31, 'invalid PR number')
     require(isinstance(value['sha'], str) and re.fullmatch('[0-9a-f]{40}', value['sha']), 'invalid SHA')
@@ -147,13 +152,18 @@ class Manager:
         self.pr = None
         self.request = None
         self.receipt = None
+        self.token = None
 
-    def run(self, args, *, input=None, json_output=False, timeout=None):
+    def run(self, args, *, input=None, json_output=False, timeout=None, github_auth=False):
+        environment = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+                       'HOME': str(self.root / 'home'), 'GIT_TERMINAL_PROMPT': '0'}
+        if github_auth and self.token:
+            environment.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                               GIT_CONFIG_VALUE_0='Authorization: Basic ' + base64.b64encode(('x-access-token:' + self.token).encode()).decode())
         try:
             result = subprocess.run(args, input=input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     timeout=timeout or self.c['commandTimeout'], check=True,
-                                    env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-                                         'HOME': str(self.root / 'home'), 'GIT_TERMINAL_PROMPT': '0'})
+                                    env=environment)
         except (subprocess.SubprocessError, OSError):
             # Never forward build/helper output: it may contain credentials or PR-controlled terminal escapes.
             raise PreviewError('command failed: ' + Path(args[0]).name) from None
@@ -181,8 +191,10 @@ class Manager:
     def github_current(self, *, stopping=False):
         headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'preview-server',
                    'X-GitHub-Api-Version': '2022-11-28'}
-        if self.c.get('githubTokenFile'):
+        token = self.token
+        if not token and self.c.get('githubTokenFile'):
             token = Path(self.c['githubTokenFile']).read_text().strip()
+        if token:
             headers['Authorization'] = 'Bearer ' + token
         value = self.http('https://api.github.com/repos/' + self.c['repository'] + '/pulls/' + str(self.pr), headers=headers)
         require(value.get('base', {}).get('repo', {}).get('full_name') == self.c['repository'], 'wrong PR repository')
@@ -201,7 +213,7 @@ class Manager:
     def fetch_current(self):
         repo = self.c['sourceRepo']
         self.run([self.c['git'], '--git-dir', repo, 'fetch', '--no-tags', 'origin',
-                  '+refs/pull/%s/head:refs/previews/%s/pr-%s' % (self.pr, self.c['project'], self.pr)])
+                  '+refs/pull/%s/head:refs/previews/%s/pr-%s' % (self.pr, self.c['project'], self.pr)], github_auth=True)
         sha = self.run([self.c['git'], '--git-dir', repo, 'rev-parse', '--verify',
                         'refs/previews/%s/pr-%s^{commit}' % (self.c['project'], self.pr)])
         require(sha == self.request['sha'], 'stale PR SHA')
@@ -473,6 +485,8 @@ class Manager:
 
     def handle(self, request):
         mode = validate_request(request, self.c['repository'])
+        self.token = request.get('githubToken')
+        request = {key: value for key, value in request.items() if key != 'githubToken'}
         require(socket.gethostname() not in self.c['forbiddenHosts'] and not Path(self.c['controlHostMarker']).exists(),
                 'builds are forbidden on the control host')
         self.request, self.pr = request, request['prNumber']

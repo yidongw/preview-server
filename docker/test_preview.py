@@ -438,6 +438,26 @@ class ManagerTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(preview.PreviewError):
                 preview.config_from(target)
 
+    def test_ephemeral_token_only_reaches_github_and_fetch_not_docker_or_receipts(self):
+        token = 'github_pat_' + 'x' * 40
+        req = self.mock_lifecycle()
+        req['githubToken'] = token
+        self.manager.prepare_data = Mock(return_value=self.root)
+        result = self.manager.handle(req)
+        self.assertEqual(self.manager.token, token)
+        self.assertNotIn('githubToken', self.manager.request)
+        self.assertNotIn(token, json.dumps(result))
+        self.assertNotIn(token, (self.root / 'journal.jsonl').read_text())
+        response = Mock(stdout=b'ok')
+        with patch.object(preview.subprocess, 'run', return_value=response) as run:
+            self.manager.run(['git', 'fetch'], github_auth=True)
+            self.assertIn('GIT_CONFIG_VALUE_0', run.call_args.kwargs['env'])
+            self.manager.run(['docker', 'run'])
+            self.assertNotIn('GIT_CONFIG_VALUE_0', run.call_args.kwargs['env'])
+        self.manager.http = Mock(return_value=dict(state='open', head=dict(sha=SHA, repo=dict(full_name=REPO)), base=dict(ref='main', repo=dict(full_name=REPO)), labels=[]))
+        preview.Manager.github_current(self.manager)
+        self.assertEqual(self.manager.http.call_args.kwargs['headers']['Authorization'], 'Bearer ' + token)
+
     def test_durable_receipt_journal_no_secret_fields(self):
         self.manager.event('ready', port=49152)
         self.assertEqual(read_json(self.manager.pr_root / 'receipt.json')['sha'], SHA)
