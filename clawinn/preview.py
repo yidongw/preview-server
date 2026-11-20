@@ -2,6 +2,7 @@
 """Trusted Linux entry point. PR source runs only in constrained Docker containers."""
 import argparse
 import contextlib
+import ipaddress
 import fcntl
 import json
 import os
@@ -198,24 +199,24 @@ class Manager:
     def pr_root(self):
         return self.root / ('pr-%s' % self.pr)
 
-    def routes(self, port=None):
+    def routes(self, upstream=None):
         hosts = [url.removeprefix('https://') for url in self.urls()]
         return {'@id': 'clawinn-pr-%s' % self.pr, 'match': [{'host': hosts}],
                 'handle': [{'handler': 'headers', 'response': {'set': {'X-Clawinn-Preview-Sha': [self.request['sha']]}}},
-                           {'handler': 'reverse_proxy', 'upstreams': [{'dial': '127.0.0.1:%s' % port}]}],
+                           {'handler': 'reverse_proxy', 'upstreams': [{'dial': upstream}]}],
                 'terminal': True}
 
-    def update_route(self, port=None):
+    def update_route(self, upstream=None):
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
         routes = self.http(endpoint) or []
         route_id = 'clawinn-pr-%s' % self.pr
         routes = [route for route in routes if route.get('@id') != route_id]
-        if port is not None:
+        if upstream is not None:
             live = sum(str(route.get('@id', '')).startswith('clawinn-pr-') for route in routes)
             require(live < self.c['maxPreviews'], 'preview capacity reached')
-            routes.insert(0, self.routes(port))
-        # PUT replaces the whole array atomically. The global lock covers read/modify/write.
-        self.http(endpoint, method='PUT', body=routes)
+            routes.insert(0, self.routes(upstream))
+        # PATCH replaces an existing key; PUT creates and rejects existing routes with HTTP 409.
+        self.http(endpoint, method='PATCH', body=routes)
 
     def check_capacity(self):
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
@@ -226,7 +227,15 @@ class Manager:
 
     def build(self):
         require(shutil.disk_usage(self.c['dockerDataRoot']).free >= self.c['minFreeBytes'], 'insufficient Docker disk space')
-        builder = self.docker('buildx', 'inspect', self.c['builder'], '--format', '{{json .}}', json_output=True)
+        # buildx inspect has no --format on current releases. ls emits one JSON object per builder.
+        records = self.docker('buildx', 'ls', '--format', '{{json .}}')
+        try:
+            builders = [json.loads(line) for line in records.splitlines() if line.strip()]
+        except (ValueError, AttributeError):
+            raise PreviewError('invalid builder listing') from None
+        matches = [item for item in builders if item.get('Name') == self.c['builder']]
+        require(len(matches) == 1, 'configured builder is missing or ambiguous')
+        builder = matches[0]
         require(builder.get('Driver') == 'remote' and len(builder.get('Nodes', [])) == 1
                 and builder['Nodes'][0].get('Endpoint') == self.c['builderEndpoint'], 'unexpected build endpoint')
         info = self.docker('inspect', self.c['builderContainer'], json_output=True)[0]
@@ -383,7 +392,7 @@ class Manager:
         storefront, admin = self.urls()
         args = ['run', '-d', '--name', name, '--network', name, *self.sandbox(),
                 '--label', 'clawinn.preview=true', '--label', 'clawinn.sha=' + self.request['sha'],
-                '--publish', '127.0.0.1::%s' % self.c['port'], *self.mount(data, '/preview'),
+                *self.mount(data, '/preview'),
                 *self.mount(data / 'secrets', '/preview/secrets', True),
                 '--env', 'PREVIEW_SHA=' + self.request['sha'],
                 '--env', 'TTE_ALLOWED_ORIGIN=' + storefront, '--env', 'TTE_MANAGEMENT_ORIGIN=' + admin,
@@ -394,11 +403,20 @@ class Manager:
         details = self.docker('inspect', name, json_output=True)[0]
         expected = self.docker('image', 'inspect', image, json_output=True)[0]['Id']
         require(details['Image'] == expected, 'running image does not match candidate')
-        bindings = details['NetworkSettings']['Ports'][str(self.c['port']) + '/tcp']
-        require(len(bindings) == 1 and bindings[0]['HostIp'] == '127.0.0.1', 'invalid loopback binding')
-        port = int(bindings[0]['HostPort'])
-        self.wait_health('http://127.0.0.1:%s/api/health' % port)
-        return port
+        # Docker 29 does not publish ports on --internal bridges. The trusted host-network
+        # proxy reaches the container's private address directly; no app port is published.
+        network = self.docker('network', 'inspect', name, json_output=True)[0]
+        require(network.get('Internal') is True and network.get('Driver') == 'bridge', 'invalid runtime network')
+        attached = details['NetworkSettings']['Networks']
+        require(set(attached) == {name}, 'unexpected runtime network attachment')
+        ip = ipaddress.ip_address(attached[name]['IPAddress'])
+        require(ip.version == 4 and ip.is_private and not ip.is_loopback, 'invalid private runtime address')
+        subnets = [ipaddress.ip_network(item['Subnet']) for item in network.get('IPAM', {}).get('Config', []) if item.get('Subnet')]
+        require(any(ip in subnet for subnet in subnets), 'runtime address is outside its network')
+        require(not any(details['NetworkSettings'].get('Ports', {}).values()), 'runtime ports must not be published')
+        upstream = '%s:%s' % (ip, self.c['port'])
+        self.wait_health('http://%s/api/health' % upstream)
+        return upstream
 
     def wait_health(self, url, sha_header=False):
         deadline = time.monotonic() + self.c['healthTimeout']
@@ -462,14 +480,14 @@ class Manager:
                 self.stop_app()
                 self.event('preparing-data', image=image)
                 data = self.prepare_data(image, descriptor, mode)
-                port = self.start_app(image, data, mode)
+                upstream = self.start_app(image, data, mode)
                 self.github_current()
                 self.fetch_current()
-                self.update_route(port)
+                self.update_route(upstream)
                 storefront, admin = self.urls()
                 for url in (storefront, admin):
                     self.wait_health(url + '/api/health', sha_header=True)
-                return self.event('ready', image=image, port=port, databaseMode=mode,
+                return self.event('ready', image=image, upstream=upstream, databaseMode=mode,
                                   storefrontUrl=storefront, adminUrl=admin)
             except Exception:
                 if disruptive:

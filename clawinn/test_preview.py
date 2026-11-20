@@ -237,15 +237,15 @@ class ManagerTests(unittest.TestCase):
     def test_route_replacement_preserves_other_routes_and_sets_sha(self):
         other = dict(**{'@id': 'unrelated'}, handle=[])
         self.manager.http = Mock(side_effect=[[other, {'@id': 'clawinn-pr-42'}], None])
-        self.manager.update_route(49152)
+        self.manager.update_route('172.24.0.2:8080')
         kwargs = self.manager.http.call_args.kwargs
-        self.assertEqual(kwargs['method'], 'PUT')
+        self.assertEqual(kwargs['method'], 'PATCH')
         routes = kwargs['body']
         self.assertEqual(routes[1], other)
         route = routes[0]
         self.assertEqual(route['match'][0]['host'], ['pr-42.preview.clawinn.xyz', 'pr-42.preview-admin.clawinn.xyz'])
         self.assertEqual(route['handle'][0]['response']['set']['X-Clawinn-Preview-Sha'], [SHA])
-        self.assertEqual(route['handle'][1]['upstreams'], [dict(dial='127.0.0.1:49152')])
+        self.assertEqual(route['handle'][1]['upstreams'], [dict(dial='172.24.0.2:8080')])
 
     def test_capacity_counts_previews_and_updates_reuse_own_slot(self):
         self.manager.c['maxPreviews'] = 1
@@ -290,7 +290,7 @@ class ManagerTests(unittest.TestCase):
                 self.manager.handle(request())
 
     def test_builder_rejects_unbounded_privileged_or_wrong_endpoint(self):
-        good_builder = dict(Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
+        good_builder = json.dumps(dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])]))
         good_info = dict(Config=dict(User='1000'), HostConfig=dict(Memory=1024, CpuQuota=100000,
                                                                   CpuPeriod=100000, Privileged=False))
         for changes in (dict(Privileged=True), dict(Memory=0), dict(CpuQuota=0)):
@@ -301,7 +301,7 @@ class ManagerTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(preview.PreviewError):
                 self.manager.build()
             self.manager.build_context.assert_not_called()
-        self.manager.docker = Mock(return_value=dict(Driver='docker-container', Nodes=[]))
+        self.manager.docker = Mock(return_value=json.dumps(dict(Name=self.config['builder'], Driver='docker-container', Nodes=[])))
         with self.assertRaisesRegex(preview.PreviewError, 'endpoint'):
             self.manager.build()
 
@@ -321,7 +321,7 @@ class ManagerTests(unittest.TestCase):
         self.manager.stop_app.assert_called_once()
 
     def test_builder_rejects_root_user_with_group(self):
-        good_builder = dict(Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
+        good_builder = json.dumps(dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])]))
         for user in ('0:0', '0:1000', 'root:1000', '1000:0', 'node', ''):
             info = dict(Config=dict(User=user), HostConfig=dict(Memory=1024, CpuQuota=100000,
                                                               CpuPeriod=100000, Privileged=False))
@@ -362,23 +362,51 @@ class ManagerTests(unittest.TestCase):
                     with self.assertRaisesRegex(preview.PreviewError, 'health'):
                         self.manager.wait_health('https://pr-42.preview.clawinn.xyz/api/health', sha_header=True)
 
-    def test_web_sandbox_loopback_network_secret_mount_and_identity(self):
+    def test_web_sandbox_internal_network_secret_mount_and_identity(self):
         data = self.root / 'runtime-data'
         (data / 'secrets').mkdir(parents=True)
         expected_image = dict(Id='sha256:expected')
-        details = dict(Image='sha256:expected', NetworkSettings=dict(Ports={'8080/tcp': [dict(HostIp='127.0.0.1', HostPort='49152')]}))
+        details = dict(Image='sha256:expected', NetworkSettings=dict(Ports={'8080/tcp': None},
+                       Networks={'clawinn-pr-42': {'IPAddress': '172.24.0.2'}}))
+        network = dict(Internal=True, Driver='bridge', IPAM=dict(Config=[dict(Subnet='172.24.0.0/16')]))
         self.manager.remove_network = Mock()
         self.manager.wait_health = Mock()
-        self.manager.docker = Mock(side_effect=['network-id', 'container-id', [details], [expected_image]])
-        self.assertEqual(self.manager.start_app('candidate', data, 'isolated'), 49152)
+        self.manager.docker = Mock(side_effect=['network-id', 'container-id', [details], [expected_image], [network]])
+        self.assertEqual(self.manager.start_app('candidate', data, 'isolated'), '172.24.0.2:8080')
         network_args = self.manager.docker.call_args_list[0].args
         run_args = self.manager.docker.call_args_list[1].args
         self.assertIn('--internal', network_args)
-        self.assertIn('127.0.0.1::8080', run_args)
+        self.assertNotIn('--publish', run_args)
         self.assertIn('PREVIEW_SHA=' + SHA, run_args)
         self.assertTrue(any('target=/preview/secrets,readonly' in arg for arg in run_args))
         self.assertIn('no-new-privileges:true', run_args)
         self.assertEqual(run_args[-2:], ('deploy/preview/app.cjs', 'serve'))
+        self.manager.wait_health.assert_called_once_with('http://172.24.0.2:8080/api/health')
+
+    def test_buildx_ls_selects_exact_named_builder_from_json_lines(self):
+        builder = dict(Name=self.config['builder'], Driver='remote', Nodes=[dict(Endpoint=self.config['builderEndpoint'])])
+        info = dict(Config=dict(User='1000:1000'), HostConfig=dict(Memory=1024, CpuQuota=100000, CpuPeriod=100000, Privileged=False))
+        self.manager.docker = Mock(side_effect=[json.dumps(dict(Name='default', Driver='docker')) + '\n' + json.dumps(builder), [info]])
+        self.manager.build_context = Mock()
+        self.manager.build()
+        self.assertEqual(self.manager.docker.call_args_list[0].args, ('buildx', 'ls', '--format', '{{json .}}'))
+
+    def test_runtime_rejects_noninternal_network_extra_attachment_and_published_port(self):
+        data = self.root / 'runtime-data'
+        (data / 'secrets').mkdir(parents=True)
+        good = dict(Image='image-id', NetworkSettings=dict(Ports={'8080/tcp': None}, Networks={'clawinn-pr-42': {'IPAddress': '172.24.0.2'}}))
+        network = dict(Internal=True, Driver='bridge', IPAM=dict(Config=[dict(Subnet='172.24.0.0/16')]))
+        for kind in ('external', 'extra-network', 'public-ip', 'outside-subnet', 'published'):
+            details, net = copy.deepcopy(good), copy.deepcopy(network)
+            if kind == 'external': net['Internal'] = False
+            if kind == 'extra-network': details['NetworkSettings']['Networks']['bridge'] = {'IPAddress': '172.17.0.2'}
+            if kind == 'public-ip': details['NetworkSettings']['Networks']['clawinn-pr-42']['IPAddress'] = '8.8.8.8'
+            if kind == 'outside-subnet': details['NetworkSettings']['Networks']['clawinn-pr-42']['IPAddress'] = '172.25.0.2'
+            if kind == 'published': details['NetworkSettings']['Ports']['8080/tcp'] = [dict(HostIp='0.0.0.0', HostPort='8080')]
+            self.manager.remove_network = Mock()
+            self.manager.docker = Mock(side_effect=['network', 'container', [details], [dict(Id='image-id')], [net]])
+            with self.subTest(kind=kind), self.assertRaises(preview.PreviewError):
+                self.manager.start_app('candidate', data, 'isolated')
 
     def test_durable_receipt_journal_no_secret_fields(self):
         self.manager.event('ready', port=49152)
