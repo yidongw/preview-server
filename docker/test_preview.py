@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -545,6 +546,197 @@ class ManagerTests(unittest.TestCase):
         journal = (self.root / 'journal.jsonl').read_text().splitlines()
         self.assertEqual(json.loads(journal[0])['state'], 'ready')
         self.assertEqual((self.root / 'journal.jsonl').stat().st_mode & 0o777, 0o600)
+
+
+MOUNT = dict(buildMode='mount', baseImage='node:22.19.0-bookworm', workdir='/app',
+             install=dict(command=['npm', 'ci'], keyFiles=['package.json', 'package-lock.json', 'apps/web/package.json'],
+                          tmpfs=['.vite-temp'], env=dict(npm_config_cache='/cache')),
+             steps=[dict(name='web', command=['npm', 'run', 'build', '-w', 'web'], inputs=['apps/web/', 'package'], outputs=['apps/web/dist']),
+                    dict(name='server', command=['npm', 'run', 'server:build'], inputs=[''], exclude=['apps/', 'docs/'], outputs=['dist'])])
+TREE = {'package.json': '100644 blob 1', 'package-lock.json': '100644 blob 2', 'apps/web/package.json': '100644 blob 3',
+        'apps/web/src/main.ts': '100644 blob 4', 'server/server.ts': '100644 blob 5', 'docs/a.md': '100644 blob 6'}
+
+
+class MountModeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        path = self.root / 'config.json'
+        path.write_text(json.dumps(dict(root=str(self.root), sourceRepo=str(self.root / 'bare'), uid=os.getuid() or 1000,
+                                        gid=os.getgid() or 1000, dockerDataRoot=str(self.root), repository=REPO, project='widgets',
+                                        dockerfile='Dockerfile', helperCommand=['node', 'adapter.cjs'], serveCommand=['node', 'adapter.cjs', 'serve'],
+                                        endpoints=[dict(name='web', domain='preview.example.com')], **copy.deepcopy(MOUNT))))
+        self.config = preview.config_from(path)
+        self.manager = preview.Manager(self.config)
+        self.manager.request, self.manager.pr = request(), 42
+        self.tree = dict(TREE)
+        self.manager.tree = Mock(side_effect=lambda sha: dict(self.tree))
+        self.manager.extract = Mock(side_effect=self.extract)
+        self.installs, self.restored, self.built = 0, [], []
+        self.manager.docker = Mock(side_effect=self.docker)
+        popen = patch.object(preview.subprocess, 'Popen', side_effect=self.popen)
+        popen.start()
+        self.addCleanup(popen.stop)
+
+    def extract(self, sha, target, paths=None):
+        (Path(target) / 'apps/web').mkdir(parents=True, exist_ok=True)
+        (Path(target) / 'package.json').write_text('{}')
+
+    @staticmethod
+    def host(arg, mounts):
+        for target, source in mounts.items():
+            if arg == target or arg.startswith(target + '/'):
+                return source + arg[len(target):]
+        return arg
+
+    def mounts(self, args):
+        return {part.split('target=')[1].split(',')[0]: part.split('source=')[1].split(',')[0]
+                for part in args if isinstance(part, str) and part.startswith('type=bind')}
+
+    def docker(self, *args, **kwargs):
+        mounts = self.mounts(args)
+        if args[-1] == 'ci':
+            self.installs += 1
+            self.install_args = args
+            work = Path(mounts['/work'])
+            for module in ('node_modules', 'apps/web/node_modules'):
+                (work / module).mkdir(parents=True)
+            return ''
+        script = args[-1]
+        if 'cp -a /cache/' in script and 'mv ' not in script:
+            self.restored.append(script)
+            return ''
+        for command in script.split(' && '):
+            words = command.split()
+            if words[0] == 'mkdir':
+                Path(self.host(words[-1], mounts)).mkdir(parents=True, exist_ok=True)
+            elif words[0] == 'mv':
+                os.rename(self.host(words[1], mounts), self.host(words[2], mounts))
+            elif words[0] == 'rm':
+                pass
+        return ''
+
+    def popen(self, args, **kwargs):
+        self.built.append(args[args.index('--entrypoint') + 2:])
+        self.build_args = args
+        process = Mock()
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        return process
+
+    def test_configuration_rejects_overlapping_outputs_and_missing_install(self):
+        bad = copy.deepcopy(self.config)
+        bad['steps'][1]['outputs'] = ['apps/web']
+        with self.assertRaisesRegex(preview.PreviewError, 'overlap'):
+            preview.mount_config(bad)
+        bad = copy.deepcopy(self.config)
+        del bad['install']
+        with self.assertRaisesRegex(preview.PreviewError, 'install'):
+            preview.mount_config(bad)
+        bad = copy.deepcopy(self.config)
+        bad['steps'][0]['outputs'] = ['../escape']
+        with self.assertRaisesRegex(preview.PreviewError, 'outputs'):
+            preview.mount_config(bad)
+
+    def test_first_build_installs_with_network_and_builds_steps_without(self):
+        handle = self.manager.build_mount()
+        self.assertRegex(handle, r'^mount:a{40}:[0-9a-f]{64}$')
+        self.assertEqual(self.installs, 1)
+        self.assertNotIn('--network', self.install_args)
+        self.assertNotIn(str(self.root / 'mount/src'), ' '.join(self.install_args))
+        self.assertEqual(sorted(command[-1] for command in self.built), ['server:build', 'web'])
+        self.assertEqual(self.build_args[self.build_args.index('--network') + 1], 'none')
+        self.assertTrue(any(arg.startswith('/app/node_modules/.vite-temp:') for arg in self.build_args))
+        self.assertEqual(self.manager.build_summary['steps'], dict(web='built', server='built'))
+        source = self.root / 'mount/src' / SHA
+        self.assertTrue((source / 'apps/web/node_modules').is_dir())
+        self.assertEqual(read_json(self.root / 'mount/src' / (SHA + '.json'))['deps'], handle.split(':')[2])
+
+    def test_same_commit_is_reused_and_unrelated_change_rebuilds_only_its_step(self):
+        first = self.manager.build_mount()
+        self.built.clear()
+        self.assertEqual(self.manager.build_mount(), first)
+        self.assertEqual(self.built, [])
+        self.manager.request = dict(request(), sha=OTHER)
+        self.tree['server/server.ts'] = '100644 blob 50'
+        self.manager.build_mount()
+        self.assertEqual(self.installs, 1)
+        self.assertEqual([command[-1] for command in self.built], ['server:build'])
+        self.assertEqual(len(self.restored), 1)
+        self.assertIn('/cache/web/', self.restored[0])
+        self.assertEqual(self.manager.build_summary['steps'], dict(web='cached', server='built'))
+        # A documentation change is outside every step's inputs: nothing is built at all.
+        self.built.clear()
+        self.manager.request = dict(request(), sha='c' * 40)
+        self.tree['docs/a.md'] = '100644 blob 60'
+        self.manager.build_mount()
+        self.assertEqual(self.built, [])
+
+    def test_lockfile_change_reinstalls_and_rebuilds(self):
+        self.manager.build_mount()
+        self.built.clear()
+        self.manager.request = dict(request(), sha=OTHER)
+        self.tree['package-lock.json'] = '100644 blob 20'
+        self.manager.build_mount()
+        self.assertEqual(self.installs, 2)
+        self.assertEqual(len(self.built), 2)
+
+    def test_committed_dependency_directory_is_refused(self):
+        self.manager.extract = Mock(side_effect=lambda sha, target, paths=None: (Path(target) / 'node_modules').mkdir(parents=True))
+        self.manager.ensure_deps = Mock(return_value=('f' * 64, ['node_modules'], False))
+        with self.assertRaisesRegex(preview.PreviewError, 'dependency directory'):
+            self.manager.build_mount()
+        self.assertFalse(list((self.root / 'mount/src').glob('.tmp-*')))
+
+    def test_failed_step_discards_tree_and_saves_nothing(self):
+        def failing(args, **kwargs):
+            process = Mock()
+            process.wait.return_value = 1
+            process.poll.return_value = 1
+            return process
+        preview.subprocess.Popen.side_effect = failing
+        with self.assertRaisesRegex(preview.PreviewError, 'build step failed'):
+            self.manager.build_mount()
+        self.assertFalse((self.root / 'mount/src' / SHA).exists())
+        self.assertFalse(list((self.root / 'mount/steps').glob('*/*/.complete')))
+
+    def test_runtime_mounts_tree_and_dependencies_read_only_on_base_image(self):
+        handle = self.manager.build_mount()
+        mounts, reference = self.manager.runtime(handle)
+        self.assertEqual(reference, 'node:22.19.0-bookworm')
+        joined = ' '.join(mounts)
+        self.assertIn('target=/app,readonly', joined)
+        self.assertIn('target=/app/apps/web/node_modules,readonly', joined)
+        self.assertNotIn('tmpfs', joined)
+        self.assertEqual(self.manager.runtime('preview-widgets:pr-42-' + SHA), ([], 'preview-widgets:pr-42-' + SHA))
+
+    def test_warm_request_validation(self):
+        warm = dict(repository=REPO, prNumber=0, sha=SHA, action='warm', labels=[])
+        self.assertIsNone(preview.validate_request(warm, REPO))
+        for bad in (dict(warm, prNumber=1), dict(warm, labels=['preview:db-dev-shared'])):
+            with self.assertRaises(preview.PreviewError):
+                preview.validate_request(bad, REPO)
+        with self.assertRaises(preview.PreviewError):
+            preview.validate_request(dict(warm, action='deploy'), REPO)
+
+    def test_collect_keeps_sources_a_slot_uses(self):
+        used = self.manager.build_mount()
+        self.manager.request = dict(request(), sha=OTHER)
+        self.tree['server/server.ts'] = '100644 blob 50'
+        self.manager.build_mount()
+        slot = self.root / 'pr-42/slots/isolated'
+        slot.mkdir(parents=True)
+        preview.atomic_json(slot / 'image.json', dict(image=used, sha=SHA))
+        self.manager.request = dict(request(), sha='c' * 40)
+        stale = time.time() - 7 * 3600
+        for item in (self.root / 'mount/src').iterdir():
+            os.utime(item, (stale, stale), follow_symlinks=False)
+        self.manager.collect()
+        self.assertTrue((self.root / 'mount/src' / SHA).is_dir())
+        self.assertFalse((self.root / 'mount/src' / OTHER).exists())
+        self.assertFalse((self.root / 'mount/src' / (OTHER + '.json')).exists())
+        self.assertTrue(list((self.root / 'mount/steps/server').iterdir()))
 
 
 def read_json(path):
