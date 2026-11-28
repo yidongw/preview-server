@@ -257,7 +257,7 @@ class Manager:
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
         routes = self.http(endpoint) or []
         route_id = self.resource_name
-        routes = [route for route in routes if route.get('@id') != route_id]
+        routes = [route for route in routes if route.get('@id') not in (route_id, 'evicted-' + route_id)]
         if upstream is not None:
             live = sum(str(route.get('@id', '')).startswith(self.resource_prefix) for route in routes)
             require(live < self.c['maxPreviews'], 'preview capacity reached')
@@ -266,11 +266,60 @@ class Manager:
         self.http(endpoint, method='PATCH', body=routes)
 
     def check_capacity(self):
+        """Called under the project lifecycle lock, after candidate validation, before disruption."""
         endpoint = self.c['caddyAdmin'] + '/config/apps/http/servers/' + self.c['caddyServer'] + '/routes'
         routes = self.http(endpoint) or []
-        own = self.resource_name
-        live = sum(str(route.get('@id', '')).startswith(self.resource_prefix) and route.get('@id') != own for route in routes)
-        require(live < self.c['maxPreviews'], 'preview capacity reached')
+        live = [route for route in routes if str(route.get('@id', '')).startswith(self.resource_prefix)
+                and route.get('@id') != self.resource_name]
+        evicted = []
+        while len(live) >= self.c['maxPreviews']:
+            # Failed update receipts overwrite their time/state while the old app stays live. Use the latest successful
+            # deployment from the durable journal, not the PR number, receipt mtime, or most recent failed request.
+            ready = {}
+            journal = self.root / 'journal.jsonl'
+            if journal.exists():
+                for line in journal.read_text().splitlines():
+                    record = json.loads(line)
+                    if record.get('state') == 'ready':
+                        ready[record['prNumber']] = record
+            candidates = []
+            for route in live:
+                match = re.fullmatch(re.escape(self.resource_prefix) + r'([1-9][0-9]*)', route.get('@id', ''))
+                require(match is not None, 'invalid active preview route')
+                number = int(match[1])
+                record = ready.get(number)
+                require(record is not None and type(record.get('time')) is int
+                        and re.fullmatch(r'[0-9a-f]{40}', str(record.get('sha', ''))),
+                        'active preview has no successful deployment record')
+                candidates.append((record['time'], number, record))
+            _, number, record = min(candidates)
+            victim = Manager(self.c)
+            victim.pr, victim.request = number, dict(prNumber=number, sha=record['sha'])
+            receipt = victim.pr_root / 'receipt.json'
+            victim.receipt = read_json(receipt) if receipt.exists() else {}
+            failed = False
+            # Do not acquire another per-PR lock: another request may already hold it while waiting for our global lock.
+            # The global project lock serializes every lifecycle mutation, including this cross-PR stop.
+            for cleanup in (victim.update_route, victim.stop_app, victim.remove_network):
+                try:
+                    cleanup()
+                except Exception:
+                    failed = True
+            if failed:
+                victim.event('eviction-failed', cleanupRequired=True, evictedBy=self.pr)
+                raise PreviewError('oldest preview eviction needs cleanup')
+            routes = self.http(endpoint) or []
+            routes.insert(0, {'@id': 'evicted-' + victim.resource_name,
+                             'match': [{'host': [url.removeprefix('https://') for url in victim.urls().values()]}],
+                             'handle': [{'handler': 'static_response', 'status_code': 410,
+                                         'body': 'This preview was stopped to make room for a newer deployment. '
+                                                 'Its data is retained. Redeploy this PR to restore it.\n'}],
+                             'terminal': True})
+            self.http(endpoint, method='PATCH', body=routes)
+            victim.event('evicted', cleanupRequired=False, evictedBy=self.pr)
+            evicted.append(number)
+            live = [route for route in live if route.get('@id') != victim.resource_name]
+        return evicted
 
     def build(self):
         require(shutil.disk_usage(self.c['dockerDataRoot']).free >= self.c['minFreeBytes'], 'insufficient Docker disk space')
@@ -520,7 +569,6 @@ class Manager:
                         raise PreviewError('preview stop needs cleanup; inspect private receipt')
                     return self.event('stopped', databaseMode=mode, cleanupRequired=False)
                 self.fetch_current()
-                self.check_capacity()
                 self.event('building', databaseMode=mode)
                 image = self.build()
                 descriptor = self.helper(image, 'schema')
@@ -530,6 +578,7 @@ class Manager:
                     self.shared_source(descriptor)
                 self.github_current()
                 self.fetch_current()
+                evicted = self.check_capacity()
                 disruptive = True
                 self.update_route()
                 self.stop_app()
@@ -542,7 +591,7 @@ class Manager:
                 urls = self.urls()
                 for url in urls.values():
                     self.wait_health(url + self.c['healthPath'], sha_header=True)
-                return self.event('ready', image=image, upstream=upstream, databaseMode=mode, urls=urls)
+                return self.event('ready', image=image, upstream=upstream, databaseMode=mode, urls=urls, evictedPreviews=evicted)
             except Exception:
                 if disruptive:
                     # Try every cleanup even if Caddy is unavailable. Never restart an old image

@@ -51,7 +51,7 @@ class ManagerTests(unittest.TestCase):
         req = request(action, [] if mode == 'isolated' else ['preview:db-' + mode])
         manager.github_current = Mock()
         manager.fetch_current = Mock()
-        manager.check_capacity = Mock()
+        manager.check_capacity = Mock(return_value=[])
         manager.build = Mock(return_value='candidate')
         manager.helper = Mock(return_value=DESCRIPTOR)
         manager.shared_source = Mock(return_value=self.root / 'synthetic')
@@ -134,6 +134,7 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(preview.PreviewError):
             self.manager.handle(req)
         self.manager.build.assert_called_once()
+        self.manager.check_capacity.assert_not_called()
         self.manager.stop_app.assert_not_called()
 
     def test_stale_after_start_never_publishes_route(self):
@@ -262,8 +263,71 @@ class ManagerTests(unittest.TestCase):
         self.manager.http = Mock(return_value=[{'@id': 'preview-widgets-pr-42'}, {'@id': 'unrelated'}])
         self.manager.check_capacity()
         self.manager.http.return_value = [{'@id': 'preview-widgets-pr-43'}]
-        with self.assertRaisesRegex(preview.PreviewError, 'capacity'):
+        with self.assertRaisesRegex(preview.PreviewError, 'successful deployment record'):
             self.manager.check_capacity()
+
+    def capacity_fixture(self):
+        self.manager.c['maxPreviews'] = 2
+        routes = [{'@id': 'preview-widgets-pr-43'}, {'@id': 'preview-widgets-pr-44'}, {'@id': 'unrelated'}]
+        records = [dict(state='ready', prNumber=43, sha=SHA, time=10),
+                   dict(state='ready', prNumber=44, sha=OTHER, time=20),
+                   dict(state='ready', prNumber=43, sha=SHA, time=30),
+                   dict(state='failed', prNumber=44, sha=SHA, time=40)]
+        (self.root / 'journal.jsonl').write_text(''.join(json.dumps(record) + '\n' for record in records))
+        for number in (43, 44):
+            data = self.root / f'pr-{number}/slots/isolated/data'
+            data.mkdir(parents=True)
+            (data / 'sentinel').write_text('retained')
+        def http(manager, url, method='GET', body=None, **kwargs):
+            if method == 'PATCH':
+                routes[:] = body
+            return copy.deepcopy(routes)
+        return routes, http
+
+    def test_capacity_evicts_oldest_successful_deployment_preserves_data_and_returns_410(self):
+        routes, http = self.capacity_fixture()
+        with patch.object(preview.Manager, 'http', http), patch.object(preview.Manager, 'docker', return_value='container') as docker:
+            self.assertEqual(self.manager.check_capacity(), [44])
+        self.assertEqual([route['@id'] for route in routes], ['evicted-preview-widgets-pr-44', 'preview-widgets-pr-43', 'unrelated'])
+        self.assertEqual(routes[0]['handle'][0]['status_code'], 410)
+        self.assertIn('pr-44.preview.example.com', routes[0]['match'][0]['host'])
+        receipt = read_json(self.root / 'pr-44/receipt.json')
+        self.assertEqual((receipt['state'], receipt['evictedBy'], receipt['sha']), ('evicted', 42, OTHER))
+        self.assertEqual((self.root / 'pr-44/slots/isolated/data/sentinel').read_text(), 'retained')
+        self.assertTrue(all('preview-widgets-pr-43' not in call.args for call in docker.call_args_list))
+        with patch.object(preview.Manager, 'http', http):
+            self.manager.pr = 44
+            self.manager.update_route('172.24.0.2:8080')
+        self.assertEqual([route['@id'] for route in routes], ['preview-widgets-pr-44', 'preview-widgets-pr-43', 'unrelated'])
+
+    def test_capacity_can_recover_when_limit_was_lowered_and_preserves_other_projects(self):
+        routes, http = self.capacity_fixture()
+        self.manager.c['maxPreviews'] = 1
+        routes.insert(0, {'@id': 'preview-another-pr-1'})
+        with patch.object(preview.Manager, 'http', http), patch.object(preview.Manager, 'docker', return_value=''):
+            self.assertEqual(self.manager.check_capacity(), [44, 43])
+        self.assertIn('preview-another-pr-1', [route['@id'] for route in routes])
+        self.assertEqual(sum(route['@id'].startswith('evicted-') for route in routes), 2)
+
+    def test_failed_candidate_or_stale_request_never_evicts(self):
+        req = self.mock_lifecycle()
+        self.manager.build.side_effect = preview.PreviewError('build failed')
+        with self.assertRaises(preview.PreviewError):
+            self.manager.handle(req)
+        self.manager.check_capacity.assert_not_called()
+
+    def test_eviction_cleanup_failure_blocks_new_deployment_and_attempts_all_cleanup(self):
+        routes, http = self.capacity_fixture()
+        with patch.object(preview.Manager, 'http', http), \
+                patch.object(preview.Manager, 'stop_app', side_effect=preview.PreviewError('cannot stop')), \
+                patch.object(preview.Manager, 'remove_network') as remove:
+            with self.assertRaisesRegex(preview.PreviewError, 'eviction needs cleanup'):
+                self.manager.check_capacity()
+        remove.assert_called_once()
+        receipt = read_json(self.root / 'pr-44/receipt.json')
+        self.assertEqual(receipt['state'], 'eviction-failed')
+        self.assertTrue(receipt['cleanupRequired'])
+        self.assertNotIn('evicted-preview-widgets-pr-44', [route['@id'] for route in routes])
 
     def test_helper_constrained_networkless_and_does_not_forward_outputs(self):
         data = self.root / 'data'
