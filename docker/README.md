@@ -85,6 +85,41 @@ Use a separate root/config/launcher and unique `project` for each repository, so
 
 Eviction removes only that PR's application container and network, retains data slots, attachments and keys, and replaces its route with HTTP 410 explaining how to redeploy it. Its receipt/journal records `evicted` and `evictedBy`; the new deployment's ready response lists `evictedPreviews`. Redeployment replaces the 410 route and reuses the existing data. Unrelated projects/routes are never candidates. Missing successful deployment records or failed cleanup block the new deployment instead of guessing or deleting data. A failure after eviction leaves the old preview stopped; it can be redeployed with its retained data. Existing GitHub checks/comments are not updated by the manager; callers can consume the returned eviction list.
 
+## Mount mode (no image per commit)
+
+With `"buildMode": "mount"` the manager builds no image. It runs a fixed, pinned `baseImage` with the commit mounted:
+
+```json
+{
+  "buildMode": "mount",
+  "baseImage": "node:22.19.0-bookworm@sha256:...",
+  "workdir": "/app",
+  "buildCpus": "2",
+  "buildMemoryLimit": "3g",
+  "cacheDays": 3,
+  "install": {"command": ["npm", "ci"], "keyFiles": ["package.json", "package-lock.json", "apps/web/package.json"],
+              "tmpfs": [".vite-temp"], "env": {"npm_config_cache": "/cache"}},
+  "steps": [
+    {"name": "web", "command": ["npm", "run", "build", "-w", "web"], "inputs": ["apps/web/", "packages/", "package"], "outputs": ["apps/web/dist"]},
+    {"name": "server", "command": ["npm", "run", "server:build"], "inputs": [""], "exclude": ["apps/", "docs/"], "outputs": ["dist"]}
+  ]
+}
+```
+
+Everything is content-addressed under `<root>/mount`, keyed by the Git blob IDs of the named files (`git ls-tree`, no checkout):
+
+| Cache | Key | Reused when |
+| --- | --- | --- |
+| `src/<sha>` | the commit | the same commit is deployed again (any PR) |
+| `deps/<key>` | base image, install command/env and the `keyFiles` blobs | the lockfile and manifests are unchanged |
+| `steps/<name>/<key>` | the step, its outputs, base image, dependency key and the blobs under its `inputs` minus `exclude` | none of that step's inputs changed |
+
+`inputs` and `exclude` are path prefixes (`""` is everything). Outputs of different steps must not overlap; steps that miss run side by side. A step's inputs must cover every file its build reads, or a cached output goes stale.
+
+The source tree is extracted by `tar` inside a networkless container as the service user. The dependency install is the only container with network access: it sees the package manifests and a shared package cache, not the tree, data or credentials. Build steps run networkless with the tree writable and the dependencies read-only; `install.tmpfs` names directories inside each `node_modules` that get a tmpfs during builds (Vite writes `node_modules/.vite-temp`). Helpers and the runtime mount the tree and dependencies read-only on the base image; the rest of the sandbox is unchanged. A slot's `image.json` records `mount:<sha>:<dependency key>`; earlier image tags keep working, so backups of older slots still use the image that wrote them. Install and build containers use `--log-driver none`.
+
+Action `warm` (`prNumber` 0, no labels) fetches the base branch, requires its head to equal `sha`, and installs and builds it, so the first deployment of a new PR finds its caches ready. After each ready deployment or warm-up the manager deletes source trees that no slot uses (after six hours), and dependency sets and step outputs unused for `cacheDays`.
+
 ## Application adapter contract
 
 The application repository supplies its adapter and includes it in the runtime image. The configured `helperCommand` accepts these appended commands:
